@@ -37,20 +37,41 @@ updateEthPrice();
 
 const app = express();
 const server = createServer(app);
+
+// CORS configuration - allowed origins (defined before Socket.IO)
+const allowedOrigins = [
+  'http://localhost:3000',
+  'http://localhost:3001',
+  process.env.CLIENT_URL
+].filter(Boolean); // Remove any undefined values
+
 const io = new Server(server, {
   cors: {
-    origin: process.env.CLIENT_URL || "http://localhost:3000",
-    methods: ["GET", "POST"]
+    origin: allowedOrigins.length > 0 ? allowedOrigins : ["http://localhost:3000"],
+    methods: ["GET", "POST"],
+    credentials: true
   }
 });
 
 // Make io available to routes
 app.set('io', io);
 
-// CORS configuration - allow all origins to unblock frontend assets
 const corsOptions = {
   origin: (origin, callback) => {
-    callback(null, true);
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    
+    // Check if origin is in allowed list
+    if (allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      // In development, allow all origins for flexibility
+      if (process.env.NODE_ENV === 'development') {
+        callback(null, true);
+      } else {
+        callback(new Error('Not allowed by CORS'));
+      }
+    }
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
