@@ -53,6 +53,16 @@ const chatSchema = new mongoose.Schema({
         },
         occurredAt: Date
       },
+      inProgress: {
+        txHash: String,
+        fromAddress: String,
+        toAddress: String,
+        performedBy: {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: 'User'
+        },
+        occurredAt: Date
+      },
       completion: {
         txHash: String,
         fromAddress: String,
@@ -62,6 +72,18 @@ const chatSchema = new mongoose.Schema({
         },
         occurredAt: Date
       },
+      disbursements: [{
+        txHash: String,
+        amountUSD: Number,
+        amountETH: Number,
+        fromAddress: String,
+        toAddress: String,
+        performedBy: {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: 'User'
+        },
+        occurredAt: Date
+      }],
       confirmation: {
         txHash: String,
         fromAddress: String,

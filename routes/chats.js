@@ -490,6 +490,120 @@ router.post(
 );
 
 router.post(
+  '/:id/escrow/in-progress',
+  [
+    auth,
+    body('txHash').notEmpty().withMessage('Transaction hash is required'),
+    body('fromAddress').notEmpty().withMessage('Talent wallet address is required')
+  ],
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
+      }
+
+      const chat = await loadChatForEscrow(req.params.id);
+      if (!chat) {
+        return res.status(404).json({ error: 'Chat not found' });
+      }
+
+      const { client, talent } = getParticipantsByRole(chat);
+      if (!client || !talent) {
+        return res.status(400).json({ error: 'Escrow requires both client and talent participants' });
+      }
+
+      if (talent.user._id.toString() !== req.user.id) {
+        return res.status(403).json({ error: 'Only the talent can mark work as in-progress' });
+      }
+
+      if (!chat.escrow?.deposit?.txHash) {
+        return res.status(400).json({ error: 'Deposit must be recorded before marking in-progress' });
+      }
+
+      if (chat.workflowStatus !== 'deposit') {
+        return res.status(400).json({ error: `Cannot mark in-progress when workflow status is "${chat.workflowStatus}"` });
+      }
+
+      // Use stored identifiers if available
+      if (chat.escrow?.identifiers) {
+        const stored = chat.escrow.identifiers;
+        req.body.jobId = stored.jobId;
+        req.body.customerId = stored.customerId;
+        req.body.talentId = stored.talentId;
+        req.body.chatId = stored.chatId;
+      } else {
+        const jobOrGigId = chat.job?._id?.toString() || chat.gig?._id?.toString() || chat._id.toString();
+        req.body.jobId = req.body.jobId || jobOrGigId;
+        req.body.customerId = req.body.customerId || client.user._id.toString();
+        req.body.talentId = req.body.talentId || talent.user._id.toString();
+        req.body.chatId = req.body.chatId || chat._id.toString();
+      }
+
+      chat.escrow = chat.escrow || {};
+      chat.escrow.inProgress = {
+        txHash: req.body.txHash,
+        fromAddress: toLowerAddress(req.body.fromAddress),
+        toAddress: toLowerAddress(req.body.fromAddress), // Talent wallet
+        performedBy: req.user.id,
+        occurredAt: new Date()
+      };
+
+      // Update deposit toAddress with talent wallet
+      if (chat.escrow.deposit && !chat.escrow.deposit.toAddress) {
+        chat.escrow.deposit.toAddress = toLowerAddress(req.body.fromAddress);
+      }
+
+      chat.workflowStatus = 'in-progress';
+      chat.markModified('escrow');
+      await chat.save();
+
+      await Transaction.create({
+        fromUser: talent.user._id,
+        toUser: client.user._id,
+        amount: 0,
+        type: 'escrow_in_progress',
+        status: 'completed',
+        description: `${buildTransactionDescription(chat)} — in-progress milestone`,
+        job: chat.job?._id,
+        gig: chat.gig?._id,
+        currency: 'USD',
+        isOnChain: true,
+        txHash: req.body.txHash,
+        fromAddress: toLowerAddress(req.body.fromAddress),
+        metadata: {
+          chatId: chat._id.toString(),
+          action: 'in-progress'
+        },
+        chat: chat._id,
+        direction: 'credit'
+      });
+
+      const io = req.app.get('io');
+      if (io) {
+        io.to(chat._id.toString()).emit('escrow-updated', {
+          chatId: chat._id.toString(),
+          escrow: chat.escrow,
+          workflowStatus: chat.workflowStatus
+        });
+      }
+
+      const updatedChat = await loadChatForEscrow(chat._id);
+      res.json({
+        message: 'Work in-progress status recorded.',
+        chat: updatedChat
+      });
+    } catch (error) {
+      console.error('Escrow in-progress error:', error);
+      res.status(500).json({
+        error: 'Server error',
+        details: error?.message || 'Unknown error'
+      });
+    }
+  }
+);
+
+router.post(
   '/:id/escrow/complete',
   [
     auth,
@@ -565,7 +679,7 @@ router.post(
         return res.status(400).json({ error: 'Deposit must be recorded before completion' });
       }
 
-      if (chat.workflowStatus !== 'deposit' && chat.workflowStatus !== 'in-progress') {
+      if (chat.workflowStatus !== 'in-progress') {
         return res.status(400).json({ error: `Cannot complete when workflow status is "${chat.workflowStatus}"` });
       }
 
@@ -626,6 +740,124 @@ router.post(
         error: 'Server error',
         details: error?.message || 'Unknown error',
         stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+      });
+    }
+  }
+);
+
+router.post(
+  '/:id/escrow/disburse',
+  [
+    auth,
+    body('txHash').notEmpty().withMessage('Transaction hash is required'),
+    body('fromAddress').notEmpty().withMessage('Client wallet address is required'),
+    body('amountUSD').isFloat({ gt: 0 }).withMessage('USD amount must be greater than zero'),
+    body('amountETH').isFloat({ gt: 0 }).withMessage('ETH amount must be greater than zero')
+  ],
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
+      }
+
+      const chat = await loadChatForEscrow(req.params.id);
+      if (!chat) {
+        return res.status(404).json({ error: 'Chat not found' });
+      }
+
+      const { client, talent } = getParticipantsByRole(chat);
+      if (!client || !talent) {
+        return res.status(400).json({ error: 'Escrow requires both client and talent participants' });
+      }
+
+      if (client.user._id.toString() !== req.user.id) {
+        return res.status(403).json({ error: 'Only the client can disburse funds' });
+      }
+
+      if (!chat.escrow?.deposit?.txHash) {
+        return res.status(400).json({ error: 'Deposit must be recorded before disbursement' });
+      }
+
+      if (!chat.escrow?.inProgress?.txHash) {
+        return res.status(400).json({ error: 'Work must be marked as in-progress before disbursement' });
+      }
+
+      if (chat.workflowStatus !== 'in-progress') {
+        return res.status(400).json({ error: `Cannot disburse when workflow status is "${chat.workflowStatus}"` });
+      }
+
+      const depositWallet = toLowerAddress(chat.escrow.deposit.fromAddress);
+      const disburseWallet = toLowerAddress(req.body.fromAddress);
+      if (depositWallet !== disburseWallet) {
+        return res.status(400).json({
+          error: 'Wallet mismatch',
+          details: `Please disburse using the same wallet used for deposit (${shortenAddress(depositWallet)})`
+        });
+      }
+
+      const amountUSD = Number(req.body.amountUSD);
+      const amountETH = Number(req.body.amountETH);
+      const talentWallet = chat.escrow.inProgress.toAddress || chat.escrow.deposit.toAddress;
+
+      chat.escrow = chat.escrow || {};
+      chat.escrow.disbursements = chat.escrow.disbursements || [];
+      
+      chat.escrow.disbursements.push({
+        txHash: req.body.txHash,
+        amountUSD,
+        amountETH,
+        fromAddress: disburseWallet,
+        toAddress: talentWallet,
+        performedBy: req.user.id,
+        occurredAt: new Date()
+      });
+
+      chat.markModified('escrow');
+      await chat.save();
+
+      await Transaction.create({
+        fromUser: client.user._id,
+        toUser: talent.user._id,
+        amount: amountUSD,
+        type: 'escrow_disburse',
+        status: 'completed',
+        description: `${buildTransactionDescription(chat)} — partial disbursement`,
+        job: chat.job?._id,
+        gig: chat.gig?._id,
+        currency: 'USD',
+        isOnChain: true,
+        txHash: req.body.txHash,
+        fromAddress: disburseWallet,
+        toAddress: talentWallet,
+        metadata: {
+          amountETH,
+          chatId: chat._id.toString(),
+          action: 'disburse'
+        },
+        chat: chat._id,
+        direction: 'debit'
+      });
+
+      const io = req.app.get('io');
+      if (io) {
+        io.to(chat._id.toString()).emit('escrow-updated', {
+          chatId: chat._id.toString(),
+          escrow: chat.escrow,
+          workflowStatus: chat.workflowStatus
+        });
+      }
+
+      const updatedChat = await loadChatForEscrow(chat._id);
+      res.json({
+        message: `Disbursement of $${amountUSD.toFixed(2)} recorded successfully.`,
+        chat: updatedChat
+      });
+    } catch (error) {
+      console.error('Escrow disbursement error:', error);
+      res.status(500).json({
+        error: 'Server error',
+        details: error?.message || 'Unknown error'
       });
     }
   }
