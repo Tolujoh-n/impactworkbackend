@@ -1,13 +1,31 @@
 const express = require('express');
 const { body, validationResult } = require('express-validator');
+const multer = require('multer');
 const { auth } = require('../middleware/auth');
 const Gig = require('../models/Gig');
 const User = require('../models/User');
 const Chat = require('../models/Chat');
 const Message = require('../models/Message');
 const Notification = require('../models/Notification');
+const { uploadImage } = require('../utils/cloudinary');
 
 const router = express.Router();
+
+// Configure multer for memory storage (to pass buffer to Cloudinary)
+const storage = multer.memoryStorage();
+const upload = multer({
+  storage: storage,
+  limits: {
+    fileSize: 5 * 1024 * 1024 // 5MB limit
+  },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith('image/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only image files are allowed'), false);
+    }
+  }
+});
 
 // @route   GET /api/gigs
 // @desc    Get all gigs with filtering and pagination
@@ -27,7 +45,7 @@ router.get('/', async (req, res) => {
       sortOrder = 'desc'
     } = req.query;
 
-    const query = { isActive: true, status: 'active' };
+    const query = { isActive: true, status: { $ne: 'archived' } };
 
     // Search functionality
     if (search) {
@@ -131,6 +149,26 @@ router.get('/my-gigs', auth, async (req, res) => {
       .skip((page - 1) * limit)
       .exec();
 
+    // Add order status counts to each gig
+    const gigsWithCounts = gigs.map(gig => {
+      const gigObj = gig.toObject ? gig.toObject() : gig;
+      const completedCount = gig.orders.filter(o => o.status === 'completed').length;
+      const activeCount = gig.orders.filter(o => 
+        o.status === 'accepted' || o.status === 'in-progress'
+      ).length;
+      const pendingCount = gig.orders.filter(o => o.status === 'pending').length;
+      const archivedCount = gig.orders.filter(o => o.status === 'cancelled').length;
+      return {
+        ...gigObj,
+        orderStatusCounts: {
+          completed: completedCount,
+          active: activeCount,
+          pending: pendingCount,
+          archived: archivedCount
+        }
+      };
+    });
+
     const total = await Gig.countDocuments(query);
     console.log('Found gigs:', gigs.length, 'Total:', total);
     
@@ -139,7 +177,7 @@ router.get('/my-gigs', auth, async (req, res) => {
     console.log('All gigs in database:', allGigs);
 
     res.json({
-      gigs,
+      gigs: gigsWithCounts,
       totalPages: Math.ceil(total / limit),
       currentPage: page,
       total
@@ -184,22 +222,80 @@ router.get('/my-ordered-gigs', auth, async (req, res) => {
       query.status = status;
     }
 
-    const gigs = await Gig.find(query)
+    // First, get all gigs that have orders from this user (no pagination yet)
+    const allGigs = await Gig.find(query)
       .populate('talent', 'username email profile stats')
       .populate('orders.client', 'username email profile stats')
       .sort({ createdAt: -1 })
-      .limit(limit * 1)
-      .skip((page - 1) * limit)
       .exec();
 
-    const total = await Gig.countDocuments(query);
-    console.log('Found ordered gigs:', gigs.length, 'Total:', total);
+    // Transform to show each order as a separate entry
+    const Chat = require('../models/Chat');
+    const gigsWithOrders = [];
+    
+    for (const gig of allGigs) {
+      // Filter orders for this user - handle both populated and unpopulated client fields
+      const userOrders = gig.orders.filter(order => {
+        const clientId = order.client?._id || order.client;
+        return clientId && clientId.toString() === req.user.id.toString();
+      });
+      
+      for (const order of userOrders) {
+        let chatId = null;
+        // Find chat for all non-pending statuses (accepted, in-progress, completed)
+        if (order.status !== 'pending' && order.status !== 'rejected' && order.status !== 'cancelled') {
+          // First try to use stored chatId if available
+          if (order.chatId) {
+            chatId = order.chatId.toString();
+          } else if (order.approvedAt) {
+            // Fallback: Find chat created around the time this order was approved
+            // Since each order creates a new chat, find the most recent one for this gig/client
+            const orderClientId = order.client?._id || order.client;
+            const gigTalentId = gig.talent?._id || gig.talent;
+            const chatQuery = {
+              gig: gig._id,
+              type: 'gig',
+              'participants.user': { $all: [gigTalentId, orderClientId] },
+              createdAt: {
+                $gte: new Date(order.approvedAt.getTime() - 60000), // 1 minute before
+                $lte: new Date(order.approvedAt.getTime() + 60000)  // 1 minute after
+              }
+            };
+            const chat = await Chat.findOne(chatQuery)
+              .sort({ createdAt: -1 })
+              .select('_id')
+              .limit(1);
+            if (chat) {
+              chatId = chat._id;
+            }
+          }
+        }
+        
+        // Convert to plain object if needed
+        const gigObj = gig.toObject ? gig.toObject() : gig;
+        const orderObj = order.toObject ? order.toObject() : order;
+        
+        gigsWithOrders.push({
+          ...gigObj,
+          order: orderObj,
+          chatId: chatId
+        });
+      }
+    }
+
+    // Now apply pagination to the transformed array
+    const total = gigsWithOrders.length;
+    const startIndex = (page - 1) * limit;
+    const endIndex = startIndex + limit;
+    const paginatedGigs = gigsWithOrders.slice(startIndex, endIndex);
+
+    console.log('Found ordered gigs:', allGigs.length, 'Orders:', gigsWithOrders.length, 'Paginated:', paginatedGigs.length, 'Total:', total);
 
     res.json({
-      gigs,
+      gigs: paginatedGigs,
       totalPages: Math.ceil(total / limit),
       currentPage: page,
-      total
+      total: total
     });
   } catch (error) {
     console.error(error);
@@ -258,7 +354,14 @@ router.get('/:id', async (req, res) => {
       return res.status(404).json({ error: 'Gig not found' });
     }
 
-    res.json(gig);
+    // Add order status counts
+    const gigObj = gig.toObject ? gig.toObject() : gig;
+    const completedCount = gig.orders.filter(o => o.status === 'completed').length;
+    gigObj.orderStatusCounts = {
+      completed: completedCount
+    };
+
+    res.json(gigObj);
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Server error' });
@@ -270,34 +373,90 @@ router.get('/:id', async (req, res) => {
 // @access  Private (Talent only)
 router.post('/', [
   auth,
+  upload.fields([
+    { name: 'image', maxCount: 1 },
+    { name: 'portfolioImage_0', maxCount: 1 },
+    { name: 'portfolioImage_1', maxCount: 1 },
+    { name: 'portfolioImage_2', maxCount: 1 },
+    { name: 'portfolioImage_3', maxCount: 1 },
+    { name: 'portfolioImage_4', maxCount: 1 }
+  ]), // Handle main image and portfolio images
   body('title').notEmpty().withMessage('Title is required'),
-  body('description').notEmpty().withMessage('Description is required'),
-  body('category').isIn(['web-development', 'mobile-development', 'design', 'writing', 'marketing', 'data-science', 'other']).withMessage('Invalid category'),
+  body('description')
+    .notEmpty().withMessage('Description is required')
+    .custom((value) => {
+      if (!value || typeof value !== 'string') {
+        throw new Error('Description is required');
+      }
+      // Strip HTML tags and check if there's actual text content
+      const textContent = value.replace(/<[^>]*>/g, '').trim();
+      if (textContent.length === 0) {
+        throw new Error('Description must contain actual content, not just formatting');
+      }
+      return true;
+    }),
+  body('category').isIn(['graphics-design', 'digital-marketing', 'writing-translation', 'video-animation', 'music-audio', 'programming-tech', 'business', 'lifestyle', 'data', 'photography', 'online-marketing', 'translation', 'other']).withMessage('Invalid category'),
   body('type').isIn(['professional', 'labour']).withMessage('Invalid type'),
   body('pricing').custom((value) => {
-    // Check if at least one pricing type is provided
-    const hasBasic = value.basic !== undefined && value.basic !== null;
-    const hasMin = value.min !== undefined && value.min !== null;
-    const hasMax = value.max !== undefined && value.max !== null;
+    // Parse JSON string if needed (FormData sends JSON as strings)
+    let pricing = value;
+    if (typeof value === 'string') {
+      try {
+        pricing = JSON.parse(value);
+      } catch (e) {
+        // If parsing fails, it might be empty or malformed
+        throw new Error('Invalid pricing format. Please provide valid pricing data.');
+      }
+    }
+    
+    if (!pricing || typeof pricing !== 'object') {
+      throw new Error('Pricing information is required. Provide both basic and premium offers.');
+    }
+    
+    // Check for new basic/premium structure
+    const hasBasicOffer = pricing.basic && pricing.basic.price !== undefined && pricing.basic.price !== null && pricing.basic.price !== '';
+    const hasPremiumOffer = pricing.premium && pricing.premium.price !== undefined && pricing.premium.price !== null && pricing.premium.price !== '';
+    
+    // Check for legacy pricing structure (for backward compatibility)
+    const hasBasic = pricing.basic !== undefined && typeof pricing.basic === 'number';
+    const hasMin = pricing.min !== undefined && pricing.min !== null;
+    const hasMax = pricing.max !== undefined && pricing.max !== null;
     const hasRange = hasMin && hasMax;
     
-    if (!hasBasic && !hasMin && !hasRange) {
-      throw new Error('Pricing information is required');
+    // Accept either new structure (basic/premium offers) or legacy structure
+    if (!hasBasicOffer && !hasPremiumOffer && !hasBasic && !hasMin && !hasRange) {
+      throw new Error('Pricing information is required. Provide both basic and premium offers with prices.');
     }
-    // If range is provided, both min and max should be present
+    
+    // Validate new structure (both basic and premium must be provided)
+    if (!hasBasicOffer) {
+      throw new Error('Basic offer with price is required');
+    }
+    if (!hasPremiumOffer) {
+      throw new Error('Premium offer with price is required');
+    }
+    
+    // Legacy validation
     if (hasMin && !hasMax) {
       throw new Error('Maximum price is required when minimum price is provided');
     }
     if (hasMax && !hasMin) {
       throw new Error('Minimum price is required when maximum price is provided');
     }
+    
     return true;
   })
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
+      console.error('Validation errors:', errors.array());
+      console.error('Request body:', req.body);
+      console.error('Files:', req.files ? 'Present' : 'Missing');
+      return res.status(400).json({ 
+        error: 'Validation failed',
+        errors: errors.array() 
+      });
     }
 
     // Check if user is a talent
@@ -305,13 +464,121 @@ router.post('/', [
       return res.status(403).json({ error: 'Only talents can create gigs' });
     }
 
+    // Image is mandatory for gigs
+    const mainImage = req.files?.image?.[0];
+    if (!mainImage) {
+      console.error('No file in request. Files:', req.files);
+      return res.status(400).json({ error: 'Gig image is required' });
+    }
+
+    console.log('File received:', {
+      originalname: mainImage.originalname,
+      mimetype: mainImage.mimetype,
+      size: mainImage.size,
+      hasBuffer: !!mainImage.buffer
+    });
+
+    // Upload main image to Cloudinary
+    let imageUrl;
+    try {
+      const uploadResult = await uploadImage(mainImage, { folder: 'workloob/gigs' });
+      imageUrl = uploadResult.url;
+      console.log('Image uploaded successfully:', imageUrl);
+    } catch (uploadError) {
+      console.error('Image upload error:', uploadError);
+      console.error('Upload error details:', uploadError.message, uploadError.stack);
+      return res.status(500).json({ error: 'Failed to upload gig image: ' + uploadError.message });
+    }
+
+    // Parse JSON fields if they come as strings (FormData sends JSON as strings)
+    let pricing = req.body.pricing;
+    if (typeof pricing === 'string') {
+      try {
+        pricing = JSON.parse(pricing);
+      } catch (e) {
+        console.error('Error parsing pricing:', e);
+        return res.status(400).json({ error: 'Invalid pricing format' });
+      }
+    }
+
+    // Parse arrays from FormData (they come as JSON strings)
+    let includes = req.body.includes;
+    if (typeof includes === 'string') {
+      try {
+        includes = JSON.parse(includes);
+      } catch (e) {
+        includes = [];
+      }
+    }
+
+    let skills = req.body.skills;
+    if (typeof skills === 'string') {
+      try {
+        skills = JSON.parse(skills);
+      } catch (e) {
+        skills = [];
+      }
+    }
+
+    // Handle portfolio with image uploads
+    let portfolio = req.body.portfolio;
+    if (typeof portfolio === 'string') {
+      try {
+        portfolio = JSON.parse(portfolio);
+      } catch (e) {
+        portfolio = [];
+      }
+    }
+
+    // Upload portfolio images if any
+    if (Array.isArray(portfolio) && portfolio.length > 0) {
+      for (let i = 0; i < portfolio.length; i++) {
+        const portfolioItem = portfolio[i];
+        if (portfolioItem.imageIndex !== null && portfolioItem.imageIndex !== undefined) {
+          const portfolioImageFile = req.files?.[`portfolioImage_${portfolioItem.imageIndex}`]?.[0];
+          if (portfolioImageFile) {
+            try {
+              const uploadResult = await uploadImage(portfolioImageFile, { folder: 'workloob/gigs/portfolio' });
+              portfolioItem.imageUrl = uploadResult.url;
+              delete portfolioItem.imageIndex; // Remove temporary index
+            } catch (uploadError) {
+              console.error(`Error uploading portfolio image ${i}:`, uploadError);
+              // Continue with other items even if one fails
+              portfolioItem.imageUrl = null;
+            }
+          }
+        }
+      }
+      // Filter out items without images or descriptions
+      portfolio = portfolio.filter(item => item.imageUrl || (item.description && item.description.trim() !== ''));
+    }
+
+    // Parse location if provided
+    let location = { remote: true };
+    if (req.body.location) {
+      try {
+        location = typeof req.body.location === 'string' ? JSON.parse(req.body.location) : req.body.location;
+      } catch (e) {
+        location = { remote: true };
+      }
+    }
+
     const gigData = {
-      ...req.body,
+      title: req.body.title,
+      description: req.body.description,
+      category: req.body.category,
+      subCategory: req.body.subCategory || null,
+      type: req.body.type,
+      pricing: pricing,
+      includes: includes || [],
+      skills: skills || [],
+      portfolio: portfolio || [],
+      imageUrl: imageUrl,
+      location: location,
       talent: req.user.id
     };
 
     console.log('Creating gig with talent:', req.user.id);
-    console.log('Gig data:', gigData);
 
     const gig = new Gig(gigData);
     await gig.save();
@@ -353,15 +620,10 @@ router.post('/:id/order', [
       return res.status(404).json({ error: 'Gig not found' });
     }
 
-    // Check if gig is still active
-    if (gig.status !== 'active') {
+    // Allow orders as long as gig is not archived or cancelled
+    // Completed gigs can still accept new orders (similar to how jobs work)
+    if (gig.status === 'archived' || gig.status === 'cancelled') {
       return res.status(400).json({ error: 'Gig is no longer accepting orders' });
-    }
-
-    // Check if user already ordered
-    const existingOrder = gig.orders.find(order => order.client.toString() === req.user.id);
-    if (existingOrder) {
-      return res.status(400).json({ error: 'You have already ordered this gig' });
     }
 
     // Check if user is the gig owner
@@ -369,8 +631,11 @@ router.post('/:id/order', [
       return res.status(400).json({ error: 'You cannot order your own gig' });
     }
 
+    // Allow multiple orders from the same client - they can reorder
+
     const order = {
       client: req.user.id,
+      package: req.body.package || 'basic', // 'basic' or 'premium'
       requirements: req.body.requirements,
       budget: req.body.budget,
       timeline: req.body.timeline,
@@ -379,18 +644,6 @@ router.post('/:id/order', [
 
     gig.orders.push(order);
     await gig.save();
-
-    // Create chat between talent and client
-    const chat = new Chat({
-      participants: [
-        { user: gig.talent, role: 'talent' },
-        { user: req.user.id, role: 'client' }
-      ],
-      type: 'gig',
-      gig: gig._id,
-      status: 'active'
-    });
-    await chat.save();
 
     // Create notification for talent
     const notification = new Notification({
@@ -402,8 +655,7 @@ router.post('/:id/order', [
         gigId: gig._id,
         gigTitle: gig.title,
         clientId: req.user.id,
-        clientName: req.user.username,
-        chatId: chat._id
+        clientName: req.user.username
       }
     });
     await notification.save();
@@ -413,8 +665,7 @@ router.post('/:id/order', [
 
     res.json({ 
       message: 'Order placed successfully', 
-      gig,
-      chatId: chat._id
+      gig
     });
   } catch (error) {
     console.error(error);
@@ -438,7 +689,58 @@ router.get('/:id/orders', auth, async (req, res) => {
       return res.status(403).json({ error: 'Not authorized to view orders' });
     }
 
-    res.json({ orders: gig.orders });
+    // Find chat IDs for accepted orders
+    const Chat = require('../models/Chat');
+    const ordersWithChats = await Promise.all(gig.orders.map(async (order) => {
+      const orderObj = order.toObject();
+      // Find chat for all non-pending statuses (accepted, in-progress, completed)
+      if (order.status !== 'pending' && order.status !== 'rejected' && order.status !== 'cancelled') {
+        // First try to use stored chatId if available
+        if (order.chatId) {
+          orderObj.chatId = order.chatId.toString();
+        } else if (order.approvedAt) {
+          // Fallback: Find chat created around the time this order was approved
+          const chatQuery = {
+            gig: gig._id,
+            type: 'gig',
+            'participants.user': { $all: [gig.talent, order.client] },
+            createdAt: {
+              $gte: new Date(order.approvedAt.getTime() - 60000), // 1 minute before
+              $lte: new Date(order.approvedAt.getTime() + 60000)  // 1 minute after
+            }
+          };
+          const chat = await Chat.findOne(chatQuery)
+            .sort({ createdAt: -1 })
+            .select('_id')
+            .limit(1);
+          if (chat) {
+            orderObj.chatId = chat._id;
+          }
+        }
+      }
+      return orderObj;
+    }));
+
+    // Add order status counts to gig
+    const gigObj = gig.toObject ? gig.toObject() : gig;
+    const completedCount = gig.orders.filter(o => o.status === 'completed').length;
+    const archivedCount = gig.orders.filter(o => o.status === 'cancelled').length;
+    const pendingCount = gig.orders.filter(o => o.status === 'pending').length;
+    const acceptedCount = gig.orders.filter(o => o.status === 'accepted').length;
+    const inProgressCount = gig.orders.filter(o => o.status === 'in-progress').length;
+    
+    gigObj.orderStatusCounts = {
+      completed: completedCount,
+      archived: archivedCount,
+      pending: pendingCount,
+      accepted: acceptedCount,
+      'in-progress': inProgressCount
+    };
+
+    res.json({ 
+      gig: gigObj,
+      orders: ordersWithChats 
+    });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Server error' });
@@ -469,13 +771,12 @@ router.post('/:id/orders/:orderId/approve', auth, async (req, res) => {
     // Update order status
     order.status = 'accepted';
     order.approvedAt = new Date();
-    await gig.save();
-
-    // Create chat between talent and client
+    
+    // Create chat between talent and client (each order gets its own chat)
     const chat = new Chat({
       participants: [
-        { user: gig.talent, role: 'talent' },
-        { user: order.client, role: 'client' }
+        { user: gig.talent, role: 'talent', participantType: 'owner' },
+        { user: order.client, role: 'client', participantType: 'owner' }
       ],
       type: 'gig',
       gig: gig._id,
@@ -491,6 +792,16 @@ router.post('/:id/orders/:orderId/approve', auth, async (req, res) => {
     // Set unread count after saving
     chat.unreadCount.set(gig.talent.toString(), 0);
     chat.unreadCount.set(order.client.toString(), 1);
+    
+    await chat.save();
+    
+    // Store chat ID in the order (if the order schema supports it)
+    // Note: Since orders are embedded, we'll store it in a custom field
+    if (!order.chatId) {
+      order.chatId = chat._id;
+    }
+    
+    await gig.save();
 
     // Add initial message with order details
     const orderDetails = `
@@ -525,8 +836,21 @@ Let's discuss the project details and get started!
       }
     });
 
-    await chat.save();
     await Promise.all([message.save(), notification.save()]);
+
+    // Emit socket event for real-time updates
+    const io = req.app.get('io');
+    if (io) {
+      io.emit('order:approved', {
+        gigId: gig._id.toString(),
+        orderId: order._id.toString(),
+        chatId: chat._id.toString()
+      });
+      io.emit('gig:updated', {
+        gigId: gig._id.toString(),
+        _id: gig._id.toString()
+      });
+    }
 
     res.json({ message: 'Order approved successfully', chat: chat._id });
   } catch (error) {
@@ -561,6 +885,19 @@ router.post('/:id/orders/:orderId/reject', auth, async (req, res) => {
     order.rejectedAt = new Date();
     await gig.save();
 
+    // Emit socket event for real-time updates
+    const io = req.app.get('io');
+    if (io) {
+      io.emit('order:rejected', {
+        gigId: gig._id.toString(),
+        orderId: order._id.toString()
+      });
+      io.emit('gig:updated', {
+        gigId: gig._id.toString(),
+        _id: gig._id.toString()
+      });
+    }
+
     res.json({ message: 'Order rejected' });
   } catch (error) {
     console.error(error);
@@ -571,7 +908,7 @@ router.post('/:id/orders/:orderId/reject', auth, async (req, res) => {
 // @route   PUT /api/gigs/:id
 // @desc    Update a gig
 // @access  Private (Gig owner only)
-router.put('/:id', auth, async (req, res) => {
+router.put('/:id', auth, upload.single('image'), async (req, res) => {
   try {
     const gig = await Gig.findById(req.params.id);
     if (!gig) {
@@ -583,9 +920,68 @@ router.put('/:id', auth, async (req, res) => {
       return res.status(403).json({ error: 'Not authorized to update this gig' });
     }
 
+    // Handle image upload if provided
+    let imageUrl = gig.imageUrl; // Keep existing image if no new one uploaded
+    if (req.file) {
+      try {
+        const uploadResult = await uploadImage(req.file, { folder: 'workloob/gigs' });
+        imageUrl = uploadResult.url;
+      } catch (uploadError) {
+        console.error('Image upload error:', uploadError);
+        return res.status(500).json({ error: 'Failed to upload gig image' });
+      }
+    }
+
+    // Parse JSON fields if they come as strings
+    let pricing = req.body.pricing;
+    if (typeof pricing === 'string') {
+      try {
+        pricing = JSON.parse(pricing);
+      } catch (e) {
+        pricing = gig.pricing; // Keep existing pricing if parse fails
+      }
+    }
+
+    // Parse arrays from FormData
+    let includes = req.body.includes;
+    if (typeof includes === 'string') {
+      try {
+        includes = JSON.parse(includes);
+      } catch (e) {
+        includes = gig.includes;
+      }
+    }
+
+    let skills = req.body.skills;
+    if (typeof skills === 'string') {
+      try {
+        skills = JSON.parse(skills);
+      } catch (e) {
+        skills = gig.skills;
+      }
+    }
+
+    let portfolio = req.body.portfolio;
+    if (typeof portfolio === 'string') {
+      try {
+        portfolio = JSON.parse(portfolio);
+      } catch (e) {
+        portfolio = gig.portfolio;
+      }
+    }
+
+    const gigData = {
+      ...req.body,
+      pricing: pricing || gig.pricing,
+      includes: includes || gig.includes,
+      skills: skills || gig.skills,
+      portfolio: portfolio || gig.portfolio,
+      imageUrl: imageUrl
+    };
+
     const updatedGig = await Gig.findByIdAndUpdate(
       req.params.id,
-      { $set: req.body },
+      { $set: gigData },
       { new: true }
     ).populate('talent', 'username email profile stats');
 
@@ -613,6 +1009,56 @@ router.delete('/:id', auth, async (req, res) => {
 
     await Gig.findByIdAndDelete(req.params.id);
     res.json({ message: 'Gig deleted successfully' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// @route   PUT /api/gigs/:id/archive
+// @desc    Archive a gig
+// @access  Private (Gig owner only)
+router.put('/:id/archive', auth, async (req, res) => {
+  try {
+    const gig = await Gig.findById(req.params.id);
+    if (!gig) {
+      return res.status(404).json({ error: 'Gig not found' });
+    }
+
+    // Check if user is the gig owner
+    if (gig.talent.toString() !== req.user.id) {
+      return res.status(403).json({ error: 'Not authorized to archive this gig' });
+    }
+
+    gig.status = 'archived';
+    await gig.save();
+
+    res.json({ message: 'Gig archived successfully', gig });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// @route   PUT /api/gigs/:id/unarchive
+// @desc    Unarchive a gig
+// @access  Private (Gig owner only)
+router.put('/:id/unarchive', auth, async (req, res) => {
+  try {
+    const gig = await Gig.findById(req.params.id);
+    if (!gig) {
+      return res.status(404).json({ error: 'Gig not found' });
+    }
+
+    // Check if user is the gig owner
+    if (gig.talent.toString() !== req.user.id) {
+      return res.status(403).json({ error: 'Not authorized to unarchive this gig' });
+    }
+
+    gig.status = 'active';
+    await gig.save();
+
+    res.json({ message: 'Gig unarchived successfully', gig });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Server error' });

@@ -1,5 +1,6 @@
 const express = require('express');
 const { body, validationResult } = require('express-validator');
+const multer = require('multer');
 const mongoose = require('mongoose');
 const User = require('../models/User');
 const Job = require('../models/Job');
@@ -7,8 +8,25 @@ const Gig = require('../models/Gig');
 const Rating = require('../models/Rating');
 const Transaction = require('../models/Transaction');
 const { auth } = require('../middleware/auth');
+const { uploadImage } = require('../utils/cloudinary');
 
 const router = express.Router();
+
+// Configure multer for memory storage (to pass buffer to Cloudinary)
+const storage = multer.memoryStorage();
+const upload = multer({
+  storage: storage,
+  limits: {
+    fileSize: 5 * 1024 * 1024 // 5MB limit
+  },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith('image/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only image files are allowed'), false);
+    }
+  }
+});
 
 const toObjectId = (value) => {
   if (!value) return null;
@@ -201,11 +219,105 @@ router.get('/profile/:username/ratings', async (req, res) => {
   }
 });
 
+// @route   GET /api/users/stats
+// @desc    Get detailed user statistics
+// @access  Private
+router.get('/stats', auth, async (req, res) => {
+  try {
+    const userId = req.user._id;
+
+    // Calculate earnings from completed jobs/gigs
+    let totalEarned = 0;
+    let totalSpent = 0;
+
+    // Get completed jobs where user is talent
+    const completedJobsAsTalent = await Job.find({
+      'applications.talent': userId,
+      'applications.status': 'accepted',
+      status: 'completed'
+    }).select('budget');
+
+    completedJobsAsTalent.forEach(job => {
+      totalEarned += job.budget || 0;
+    });
+
+    // Get completed gigs where user is talent
+    const completedGigsAsTalent = await Gig.find({
+      talent: userId,
+      'orders.status': 'completed'
+    }).select('orders');
+
+    completedGigsAsTalent.forEach(gig => {
+      gig.orders.forEach(order => {
+        if (order.status === 'completed' && order.price) {
+          totalEarned += order.price;
+        }
+      });
+    });
+
+    // Get completed jobs where user is client
+    const completedJobsAsClient = await Job.find({
+      client: userId,
+      status: 'completed'
+    }).select('budget');
+
+    completedJobsAsClient.forEach(job => {
+      totalSpent += job.budget || 0;
+    });
+
+    // Get completed gigs where user is client
+    const completedGigsAsClient = await Gig.find({
+      'orders.client': userId,
+      'orders.status': 'completed'
+    }).select('orders');
+
+    completedGigsAsClient.forEach(gig => {
+      gig.orders.forEach(order => {
+        if (order.status === 'completed' && order.price) {
+          totalSpent += order.price;
+        }
+      });
+    });
+
+    const ratingMetrics = await calculateRatingMetrics(userId);
+
+    const statsSnapshot =
+      typeof req.user.stats?.toObject === 'function'
+        ? req.user.stats.toObject()
+        : { ...(req.user.stats || {}) };
+
+    statsSnapshot.rating = {
+      average: ratingMetrics.average,
+      count: ratingMetrics.count,
+      totalScore: ratingMetrics.totalScore
+    };
+
+    res.json({
+      stats: statsSnapshot,
+      earnings: {
+        totalEarned,
+        totalSpent,
+        netEarnings: totalEarned - totalSpent
+      },
+      rating: statsSnapshot.rating
+    });
+  } catch (error) {
+    console.error('Get stats error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // @route   GET /api/users/:id
 // @desc    Get user by ID (authenticated)
 // @access  Private
 router.get('/:id', auth, async (req, res) => {
   try {
+    // Validate that the id is a valid ObjectId format
+    const mongoose = require('mongoose');
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ error: 'Invalid user ID format' });
+    }
+
     const user = await User.findById(req.params.id)
       .select('-password');
     
@@ -223,7 +335,14 @@ router.get('/:id', auth, async (req, res) => {
 // @route   PUT /api/users/profile
 // @desc    Update user profile
 // @access  Private
-router.put('/profile', auth, [
+router.put('/profile', auth, upload.fields([
+  { name: 'avatar', maxCount: 1 },
+  { name: 'portfolioImage_0', maxCount: 1 },
+  { name: 'portfolioImage_1', maxCount: 1 },
+  { name: 'portfolioImage_2', maxCount: 1 },
+  { name: 'portfolioImage_3', maxCount: 1 },
+  { name: 'portfolioImage_4', maxCount: 1 }
+]), [
   body('profile.firstName').optional().trim(),
   body('profile.lastName').optional().trim(),
   body('profile.bio').optional().trim(),
@@ -232,7 +351,17 @@ router.put('/profile', auth, [
   body('profile.avatar').optional().trim(),
   body('profile.skills').optional().isArray(),
   body('profile.languages').optional().isArray(),
-  body('email').optional().isEmail().normalizeEmail()
+  body('email').optional().custom((value) => {
+    if (value === undefined || value === null || value === '') {
+      return true; // Allow empty email
+    }
+    // Validate email format if provided
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(value)) {
+      throw new Error('Invalid email format');
+    }
+    return true;
+  }).normalizeEmail()
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -243,6 +372,52 @@ router.put('/profile', auth, [
     const user = await User.findById(req.user._id);
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Handle profile image upload
+    if (req.files?.avatar?.[0]) {
+      try {
+        const uploadResult = await uploadImage(req.files.avatar[0], { folder: 'workloob/profiles' });
+        user.profile.avatar = uploadResult.url;
+      } catch (uploadError) {
+        console.error('Profile image upload error:', uploadError);
+        return res.status(500).json({ error: 'Failed to upload profile image: ' + uploadError.message });
+      }
+    }
+
+    // Handle portfolio image uploads
+    let portfolioData = req.body.profile?.portfolio;
+    if (portfolioData && typeof portfolioData === 'string') {
+      try {
+        portfolioData = JSON.parse(portfolioData);
+      } catch (e) {
+        console.error('Error parsing portfolio data:', e);
+      }
+    }
+
+    if (portfolioData && Array.isArray(portfolioData)) {
+      // Upload portfolio images if provided
+      for (let i = 0; i < portfolioData.length; i++) {
+        const portfolioItem = portfolioData[i];
+        const portfolioImageFile = req.files?.[`portfolioImage_${i}`]?.[0];
+        
+        if (portfolioImageFile) {
+          try {
+            const uploadResult = await uploadImage(portfolioImageFile, { folder: 'workloob/portfolios' });
+            portfolioItem.image = uploadResult.url;
+            // Clear imageUrl if file was uploaded
+            if (portfolioItem.imageUrl) {
+              delete portfolioItem.imageUrl;
+            }
+          } catch (uploadError) {
+            console.error(`Portfolio image ${i} upload error:`, uploadError);
+            return res.status(500).json({ error: `Failed to upload portfolio image ${i + 1}: ` + uploadError.message });
+          }
+        } else if (portfolioItem.imageUrl && !portfolioItem.image) {
+          // Keep existing imageUrl if no file was uploaded and no image exists
+          portfolioItem.image = portfolioItem.imageUrl;
+        }
+      }
     }
 
     // Update profile fields
@@ -262,7 +437,8 @@ router.put('/profile', auth, [
       if (req.body.profile.phone !== undefined) {
         user.profile.phone = req.body.profile.phone;
       }
-      if (req.body.profile.avatar !== undefined) {
+      // Avatar is handled above via file upload
+      if (req.body.profile.avatar && !req.files?.avatar?.[0]) {
         user.profile.avatar = req.body.profile.avatar;
       }
       if (req.body.profile.skills !== undefined) {
@@ -272,30 +448,57 @@ router.put('/profile', auth, [
         user.profile.languages = req.body.profile.languages;
       }
       if (req.body.profile.socialLinks !== undefined) {
+        const socialLinks = typeof req.body.profile.socialLinks === 'string' 
+          ? JSON.parse(req.body.profile.socialLinks) 
+          : req.body.profile.socialLinks;
         user.profile.socialLinks = {
           ...user.profile.socialLinks,
-          ...req.body.profile.socialLinks
+          ...socialLinks
         };
       }
       if (req.body.profile.experience !== undefined) {
         user.profile.experience = req.body.profile.experience;
       }
-      if (req.body.profile.portfolio !== undefined) {
-        user.profile.portfolio = req.body.profile.portfolio;
+      if (portfolioData !== undefined) {
+        user.profile.portfolio = portfolioData;
       }
     }
 
-    // Update email if provided and user has email (not wallet-only)
-    if (req.body.email && user.email) {
-      // Check if email is already taken by another user
-      const existingUser = await User.findOne({ 
-        email: req.body.email,
-        _id: { $ne: user._id }
-      });
-      if (existingUser) {
-        return res.status(400).json({ error: 'Email already in use' });
+    // Update email if provided
+    // FormData sends email as a string, so we need to handle it properly
+    const emailFromBody = req.body.email;
+    console.log('[users:profile] Email from body:', emailFromBody, 'Type:', typeof emailFromBody);
+    
+    if (emailFromBody !== undefined && emailFromBody !== null) {
+      const emailValue = typeof emailFromBody === 'string' ? emailFromBody.trim() : String(emailFromBody).trim();
+      
+      // If email is provided and not empty, validate and update
+      if (emailValue && emailValue !== '') {
+        // Validate email format
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(emailValue)) {
+          console.log('[users:profile] Invalid email format:', emailValue);
+          return res.status(400).json({ error: 'Invalid email format' });
+        }
+        
+        // Check if email is already taken by another user
+        const existingUser = await User.findOne({ 
+          email: emailValue,
+          _id: { $ne: user._id }
+        });
+        if (existingUser) {
+          console.log('[users:profile] Email already in use:', emailValue);
+          return res.status(400).json({ error: 'Email already in use' });
+        }
+        user.email = emailValue;
+        console.log('[users:profile] Email updated to:', emailValue);
+      } else {
+        // Allow clearing email if empty string is sent (only if user already has email)
+        if (user.email) {
+          user.email = emailValue;
+          console.log('[users:profile] Email cleared');
+        }
       }
-      user.email = req.body.email;
     }
 
     await user.save();
@@ -317,7 +520,8 @@ router.put('/settings', auth, [
   body('preferences.notifications').optional().isObject(),
   body('preferences.notifications.email').optional().isBoolean(),
   body('preferences.notifications.push').optional().isBoolean(),
-  body('preferences.notifications.chat').optional().isBoolean()
+  body('preferences.notifications.chat').optional().isBoolean(),
+  body('notificationEmail').optional().isEmail().withMessage('Please provide a valid email address')
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -330,21 +534,58 @@ router.put('/settings', auth, [
       return res.status(404).json({ error: 'User not found' });
     }
 
+    // Update notification email
+    if (req.body.notificationEmail !== undefined) {
+      if (req.body.notificationEmail === '' || req.body.notificationEmail === null) {
+        user.notificationEmail = undefined;
+      } else {
+        user.notificationEmail = req.body.notificationEmail.toLowerCase().trim();
+      }
+    }
+
     // Update preferences
     if (req.body.preferences) {
       if (req.body.preferences.theme !== undefined) {
         user.preferences.theme = req.body.preferences.theme;
       }
       if (req.body.preferences.notifications) {
+        console.log('Updating notification preferences:', {
+          userId: user._id,
+          current: user.preferences.notifications,
+          incoming: req.body.preferences.notifications,
+          hasNotificationEmail: !!user.notificationEmail
+        });
+        
+        // If enabling email notifications, ensure notification email is set
+        if (req.body.preferences.notifications.email === true && !user.notificationEmail) {
+          console.log('Email notifications enabled but no notification email set');
+          return res.status(400).json({ 
+            error: 'Please set a notification email address before enabling email notifications' 
+          });
+        }
+        
         user.preferences.notifications = {
           ...user.preferences.notifications,
           ...req.body.preferences.notifications
         };
+        
+        console.log('Updated notification preferences:', user.preferences.notifications);
       }
     }
 
     await user.save();
-    res.json(user.preferences);
+    
+    console.log('Settings updated successfully:', {
+      userId: user._id,
+      preferences: user.preferences,
+      notificationEmail: user.notificationEmail ? '***' + user.notificationEmail.slice(-4) : 'not set'
+    });
+    
+    // Return updated user preferences and notification email
+    res.json({
+      preferences: user.preferences,
+      notificationEmail: user.notificationEmail
+    });
   } catch (error) {
     console.error('Update settings error:', error);
     res.status(500).json({ error: 'Server error' });
@@ -897,99 +1138,65 @@ router.get('/activity', auth, async (req, res) => {
   }
 });
 
-// @route   GET /api/users/stats
-// @desc    Get detailed user statistics
+// @route   POST /api/users/test-email
+// @desc    Test email notification (for debugging)
 // @access  Private
-router.get('/stats', auth, async (req, res) => {
+router.post('/test-email', auth, async (req, res) => {
   try {
-    const userId = req.user._id;
+    const user = await User.findById(req.user._id)
+      .select('notificationEmail preferences.notifications username');
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
 
-    // Calculate earnings from completed jobs/gigs
-    let totalEarned = 0;
-    let totalSpent = 0;
-
-    if (req.user.role === 'talent') {
-      // Get earnings from completed jobs
-      const completedJobs = await Job.find({
-        'applications.talent': userId,
-        'applications.status': 'accepted',
-        status: 'completed'
-      }).populate('applications.talent', '_id');
-
-      completedJobs.forEach(job => {
-        const application = job.applications.find(app => 
-          app.talent.toString() === userId.toString() && app.status === 'accepted'
-        );
-        if (application) {
-          totalEarned += job.budget || 0;
-        }
-      });
-
-      // Get earnings from completed gig orders
-      const completedGigs = await Gig.find({
-        talent: userId,
-        'orders.status': 'completed'
-      });
-
-      completedGigs.forEach(gig => {
-        gig.orders.forEach(order => {
-          if (order.status === 'completed') {
-            totalEarned += gig.price || 0;
-          }
-        });
-      });
-    } else {
-      // Get spending on completed jobs
-      const completedJobs = await Job.find({
-        client: userId,
-        status: 'completed'
-      });
-
-      completedJobs.forEach(job => {
-        totalSpent += job.budget || 0;
-      });
-
-      // Get spending on completed gig orders
-      const completedGigs = await Gig.find({
-        'orders.client': userId,
-        'orders.status': 'completed'
-      });
-
-      completedGigs.forEach(gig => {
-        gig.orders.forEach(order => {
-          if (order.client.toString() === userId.toString() && order.status === 'completed') {
-            totalSpent += gig.price || 0;
-          }
-        });
+    if (!user.notificationEmail) {
+      return res.status(400).json({ 
+        error: 'No notification email set',
+        suggestion: 'Please set a notification email in your settings'
       });
     }
 
-    const ratingMetrics = await calculateRatingMetrics(userId);
+    if (!user.preferences?.notifications?.email) {
+      return res.status(400).json({ 
+        error: 'Email notifications are disabled',
+        suggestion: 'Please enable email notifications in your settings'
+      });
+    }
 
-    const statsSnapshot =
-      typeof req.user.stats?.toObject === 'function'
-        ? req.user.stats.toObject()
-        : { ...(req.user.stats || {}) };
-
-    statsSnapshot.rating = {
-      average: ratingMetrics.average,
-      count: ratingMetrics.count,
-      totalScore: ratingMetrics.totalScore
-    };
-
-    res.json({
-      stats: statsSnapshot,
-      earnings: {
-        totalEarned,
-        totalSpent,
-        netEarnings: totalEarned - totalSpent
-      },
-      rating: statsSnapshot.rating
+    const { sendNotificationEmail } = require('../utils/emailService');
+    
+    const result = await sendNotificationEmail({
+      to: user.notificationEmail,
+      subject: 'Test Email from Workloob',
+      title: 'Test Email Notification',
+      message: `Hello ${user.username || 'User'}! This is a test email to verify your email notification settings are working correctly.`,
+      actionUrl: '/notifications',
+      actionText: 'View Notifications'
     });
+
+    if (result.success) {
+      res.json({ 
+        success: true, 
+        message: 'Test email sent successfully',
+        messageId: result.messageId,
+        to: user.notificationEmail
+      });
+    } else {
+      res.status(500).json({ 
+        success: false,
+        error: result.error || 'Failed to send test email',
+        details: result.details
+      });
+    }
   } catch (error) {
-    console.error('Get stats error:', error);
-    res.status(500).json({ error: 'Server error' });
+    console.error('Test email error:', error);
+    res.status(500).json({ 
+      error: 'Server error',
+      message: error.message,
+      details: error.code || error.responseCode
+    });
   }
 });
 
-module.exports = router                    
+module.exports = router;                    

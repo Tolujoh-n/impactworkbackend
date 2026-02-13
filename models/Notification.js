@@ -8,7 +8,7 @@ const notificationSchema = new mongoose.Schema({
   },
   type: {
     type: String,
-    enum: ['job_application', 'job_approved', 'job_rejected', 'gig_order', 'gig_approved', 'gig_rejected', 'message', 'payment', 'system'],
+    enum: ['job_application', 'job_approved', 'job_rejected', 'gig_order', 'gig_approved', 'gig_rejected', 'message', 'payment', 'system', 'blog_published', 'blog_liked', 'blog_comment', 'blog_follow'],
     required: true
   },
   title: {
@@ -22,6 +22,17 @@ const notificationSchema = new mongoose.Schema({
   data: {
     type: mongoose.Schema.Types.Mixed,
     default: {}
+  },
+  link: {
+    type: String
+  },
+  relatedUser: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User'
+  },
+  relatedBlog: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Blog'
   },
   read: {
     type: Boolean,

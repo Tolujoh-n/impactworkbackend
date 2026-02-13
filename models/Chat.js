@@ -12,6 +12,15 @@ const chatSchema = new mongoose.Schema({
       enum: ['talent', 'client'],
       required: true
     },
+    participantType: {
+      type: String,
+      enum: ['owner', 'added'],
+      default: 'owner'
+    },
+    addedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User'
+    },
     joinedAt: {
       type: Date,
       default: Date.now

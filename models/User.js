@@ -46,9 +46,15 @@ const userSchema = new mongoose.Schema({
     sparse: true,
     trim: true
   },
+  connectedWalletAddress: {
+    type: String,
+    sparse: true,
+    trim: true,
+    default: undefined
+  },
   role: {
     type: String,
-    enum: ['talent', 'client'],
+    enum: ['talent', 'client', 'admin'],
     default: 'talent'
   },
   isActive: {
@@ -185,6 +191,13 @@ const userSchema = new mongoose.Schema({
       }
     }
   },
+  notificationEmail: {
+    type: String,
+    sparse: true,
+    lowercase: true,
+    trim: true,
+    default: undefined
+  },
   preferences: {
     theme: {
       type: String,
@@ -194,7 +207,7 @@ const userSchema = new mongoose.Schema({
     notifications: {
       email: {
         type: Boolean,
-        default: true
+        default: false
       },
       push: {
         type: Boolean,
@@ -332,9 +345,10 @@ userSchema.methods.comparePassword = async function(candidatePassword) {
   return bcrypt.compare(candidatePassword, this.password);
 };
 
-// Check if user can vote in governance
+// Check if user can vote in governance (requires 20+ activity points)
+// Note: Locked staking check (100+ LOB) must be done separately via blockchain
 userSchema.methods.canVote = function() {
-  return this.stats.activityPoints >= 9;
+  return this.stats.activityPoints >= 20;
 };
 
 // Check if user can create proposals/disputes

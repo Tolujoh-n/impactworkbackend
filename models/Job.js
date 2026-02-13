@@ -18,7 +18,11 @@ const jobSchema = new mongoose.Schema({
   category: {
     type: String,
     required: true,
-    enum: ['web-development', 'mobile-development', 'design', 'writing', 'marketing', 'data-science', 'other']
+    enum: ['graphics-design', 'digital-marketing', 'writing-translation', 'video-animation', 'music-audio', 'programming-tech', 'business', 'lifestyle', 'data', 'photography', 'online-marketing', 'translation', 'other']
+  },
+  subCategory: {
+    type: String,
+    required: false
   },
   type: {
     type: String,
@@ -34,7 +38,7 @@ const jobSchema = new mongoose.Schema({
     value: Number,
     unit: {
       type: String,
-      enum: ['days', 'weeks', 'months']
+      enum: ['hours', 'days', 'weeks', 'months']
     }
   },
   location: {
@@ -50,7 +54,7 @@ const jobSchema = new mongoose.Schema({
   deliverables: [String],
   status: {
     type: String,
-    enum: ['open', 'in-progress', 'completed', 'cancelled'],
+    enum: ['open', 'in-progress', 'completed', 'cancelled', 'archived'],
     default: 'open'
   },
   applications: [{
@@ -64,12 +68,19 @@ const jobSchema = new mongoose.Schema({
     attachments: [String],
     status: {
       type: String,
-      enum: ['pending', 'accepted', 'rejected'],
+      enum: ['pending', 'accepted', 'in-progress', 'completed', 'rejected'],
       default: 'pending'
     },
     appliedAt: {
       type: Date,
       default: Date.now
+    },
+    approvedAt: {
+      type: Date
+    },
+    chatId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Chat'
     }
   }],
   applicationCount: {
@@ -83,6 +94,10 @@ const jobSchema = new mongoose.Schema({
   startDate: Date,
   endDate: Date,
   tags: [String],
+  imageUrl: {
+    type: String,
+    required: false // Optional for jobs
+  },
   isActive: {
     type: Boolean,
     default: true

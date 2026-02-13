@@ -20,7 +20,28 @@ router.get('/', auth, async (req, res) => {
 
     // Get referral stats
     const referrals = await Referral.find({ referrer: req.user.id })
-      .populate('referredUser', 'username email createdAt stats')
+      .populate('referredUser', 'username email createdAt stats.activityPoints')
+      .sort({ createdAt: -1 });
+
+    // Check and update referral approval status based on activity points (20+ required)
+    const MIN_APPROVAL_ACTIVITY_POINTS = 20;
+    for (const referral of referrals) {
+      if (referral.status === 'pending' && referral.referredUser?.stats?.activityPoints >= MIN_APPROVAL_ACTIVITY_POINTS) {
+        referral.status = 'approved';
+        referral.approvedAt = new Date();
+        // Move from pending to available
+        if (user.referral?.lobTokens) {
+          user.referral.lobTokens.pending = Math.max(0, (user.referral.lobTokens.pending || 0) - (referral.lobTokens || 100));
+          user.referral.lobTokens.available = (user.referral.lobTokens.available || 0) + (referral.lobTokens || 100);
+        }
+        await referral.save();
+      }
+    }
+    await user.save();
+
+    // Re-fetch to get updated statuses
+    const updatedReferrals = await Referral.find({ referrer: req.user.id })
+      .populate('referredUser', 'username email createdAt stats.activityPoints')
       .sort({ createdAt: -1 });
 
     // Calculate LOB token stats
@@ -31,12 +52,12 @@ router.get('/', auth, async (req, res) => {
     };
 
     const stats = {
-      totalReferrals: referrals.length,
-      pendingReferrals: referrals.filter(ref => ref.status === 'pending').length,
-      approvedReferrals: referrals.filter(ref => ref.status === 'approved').length,
-      totalBonus: referrals.reduce((sum, ref) => sum + (ref.bonusEarned || 0), 0),
-      pendingBonus: referrals.filter(ref => ref.status === 'pending').reduce((sum, ref) => sum + (ref.bonusEarned || 0), 0),
-      approvedBonus: referrals.filter(ref => ref.status === 'approved').reduce((sum, ref) => sum + (ref.bonusEarned || 0), 0),
+      totalReferrals: updatedReferrals.length,
+      pendingReferrals: updatedReferrals.filter(ref => ref.status === 'pending').length,
+      approvedReferrals: updatedReferrals.filter(ref => ref.status === 'approved').length,
+      totalBonus: updatedReferrals.reduce((sum, ref) => sum + (ref.bonusEarned || 0), 0),
+      pendingBonus: updatedReferrals.filter(ref => ref.status === 'pending').reduce((sum, ref) => sum + (ref.bonusEarned || 0), 0),
+      approvedBonus: updatedReferrals.filter(ref => ref.status === 'approved').reduce((sum, ref) => sum + (ref.bonusEarned || 0), 0),
       lobTokens: {
         pending: lobTokens.pending || 0,
         available: lobTokens.available || 0,
@@ -51,12 +72,13 @@ router.get('/', auth, async (req, res) => {
       referralCode,
       referralLink,
       stats,
-      referrals: referrals.map(ref => ({
+      referrals: updatedReferrals.map(ref => ({
         _id: ref._id,
         referredUser: ref.referredUser,
         status: ref.status,
         lobTokens: ref.lobTokens || 100,
         activityPoints: ref.activityPoints || 5,
+        currentActivityPoints: ref.referredUser?.stats?.activityPoints || 0, // Current activity points of referred user
         bonusEarned: ref.bonusEarned || 10,
         approvedAt: ref.approvedAt,
         createdAt: ref.createdAt

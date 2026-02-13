@@ -129,11 +129,13 @@ router.post('/register-email', [
         username: newUser.username,
         email: newUser.email,
         walletAddress: newUser.walletAddress,
+        connectedWalletAddress: newUser.connectedWalletAddress,
         role: newUser.role,
         profile: newUser.profile,
         stats: newUser.stats,
         wallet: newUser.wallet
-      }
+      },
+      loginMethod: 'email'
     });
   } catch (error) {
     console.error('Registration error:', error);
@@ -352,11 +354,13 @@ router.post('/register-wallet', [
         username: newUser.username,
         email: newUser.email,
         walletAddress: newUser.walletAddress,
+        connectedWalletAddress: newUser.connectedWalletAddress,
         role: newUser.role,
         profile: newUser.profile,
         stats: newUser.stats,
         wallet: newUser.wallet
-      }
+      },
+      loginMethod: 'wallet'
     });
   } catch (error) {
     console.error('Registration error:', error);
@@ -442,11 +446,13 @@ router.post('/login', [
         username: user.username,
         email: user.email,
         walletAddress: user.walletAddress,
+        connectedWalletAddress: user.connectedWalletAddress,
         role: user.role,
         profile: user.profile,
         stats: user.stats,
         wallet: user.wallet
-      }
+      },
+      loginMethod: isEmailLogin ? 'email' : 'wallet'
     });
   } catch (error) {
     console.error('Login error:', error);
@@ -459,7 +465,13 @@ router.post('/login', [
 // @access  Private
 router.get('/me', require('../middleware/auth').auth, async (req, res) => {
   try {
-    res.json({ user: req.user });
+    // Determine login method: if user has email, they logged in with email; otherwise with wallet
+    const loginMethod = req.user.email ? 'email' : 'wallet';
+    
+    res.json({ 
+      user: req.user,
+      loginMethod 
+    });
   } catch (error) {
     console.error('Get user error:', error);
     res.status(500).json({ error: 'Server error' });

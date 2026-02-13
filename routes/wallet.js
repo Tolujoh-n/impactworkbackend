@@ -464,8 +464,8 @@ router.post('/transactions/onchain', [
       description
     } = req.body;
 
-    // Get user with wallet address
-    const user = await User.findById(req.user.id).select('walletAddress');
+    // Get user with wallet address and connected wallet address
+    const user = await User.findById(req.user.id).select('walletAddress connectedWalletAddress email');
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
@@ -476,11 +476,18 @@ router.post('/transactions/onchain', [
       return res.status(400).json({ error: 'Transaction already exists' });
     }
 
+    // Determine which wallet address to use: 
+    // For email users, use connectedWalletAddress if available, otherwise walletAddress
+    // For wallet users, use walletAddress
+    const userWalletAddress = user.email && user.connectedWalletAddress 
+      ? user.connectedWalletAddress 
+      : user.walletAddress;
+
     // Determine if this transaction is for the current user
-    const isFromUser = user.walletAddress && fromAddress && 
-                      user.walletAddress.toLowerCase() === fromAddress.toLowerCase();
-    const isToUser = user.walletAddress && toAddress && 
-                    user.walletAddress.toLowerCase() === toAddress.toLowerCase();
+    const isFromUser = userWalletAddress && fromAddress && 
+                      userWalletAddress.toLowerCase() === fromAddress.toLowerCase();
+    const isToUser = userWalletAddress && toAddress && 
+                    userWalletAddress.toLowerCase() === toAddress.toLowerCase();
 
     // Determine direction
     let direction = 'credit';
@@ -491,7 +498,7 @@ router.post('/transactions/onchain', [
     }
 
     // Create transaction record
-    const transaction = new Transaction({
+    const transactionData = {
       fromUser: isFromUser ? req.user.id : null,
       toUser: isToUser ? req.user.id : null,
       amount,
@@ -499,18 +506,40 @@ router.post('/transactions/onchain', [
       status: 'completed',
       description: description || `On-chain ${type}`,
       txHash,
-      tokenAddress,
-      tokenSymbol,
+      tokenSymbol: tokenSymbol || 'ETH',
       fromAddress,
       toAddress,
       blockNumber,
       gasUsed,
-      gasPrice,
       isOnChain: true,
       currency: tokenSymbol || 'ETH',
       direction
+    };
+
+    // Only include tokenAddress if it's provided (for ERC20 tokens)
+    // For native ETH transfers, tokenAddress should be null/undefined
+    if (tokenAddress !== null && tokenAddress !== undefined) {
+      transactionData.tokenAddress = tokenAddress;
+    }
+
+    // Only include gasPrice if it's provided and valid
+    if (gasPrice !== null && gasPrice !== undefined && gasPrice !== '0') {
+      transactionData.gasPrice = gasPrice;
+    }
+
+    console.log('Creating transaction record:', {
+      txHash,
+      type,
+      tokenSymbol: transactionData.tokenSymbol,
+      tokenAddress: transactionData.tokenAddress || 'null (native ETH)',
+      fromAddress,
+      toAddress,
+      isFromUser,
+      isToUser,
+      direction
     });
 
+    const transaction = new Transaction(transactionData);
     await transaction.save();
 
     res.status(201).json({
@@ -519,6 +548,108 @@ router.post('/transactions/onchain', [
     });
   } catch (error) {
     console.error('Save on-chain transaction error:', error);
+    
+    // Handle validation errors
+    if (error.name === 'ValidationError') {
+      return res.status(400).json({ 
+        error: 'Validation error', 
+        details: error.errors 
+      });
+    }
+    
+    // Handle duplicate key error (txHash already exists)
+    if (error.code === 11000) {
+      return res.status(400).json({ 
+        error: 'Transaction already exists',
+        txHash: error.keyValue?.txHash 
+      });
+    }
+    
+    res.status(500).json({ 
+      error: 'Server error',
+      message: error.message 
+    });
+  }
+});
+
+// @route   POST /api/wallet/connect
+// @desc    Connect wallet address for email-logged users
+// @access  Private
+router.post('/connect', [
+  auth,
+  body('walletAddress').notEmpty().withMessage('Wallet address is required'),
+  body('walletAddress').isString().withMessage('Wallet address must be a string'),
+  body('walletAddress').matches(/^0x[a-fA-F0-9]{40}$/).withMessage('Invalid wallet address format')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const { walletAddress } = req.body;
+    const normalizedWalletAddress = walletAddress.toLowerCase().trim();
+
+    // Get user
+    const user = await User.findById(req.user.id);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Only allow this for email-logged users (users with email)
+    if (!user.email) {
+      return res.status(400).json({ error: 'This endpoint is only for email-logged users' });
+    }
+
+    // Check if wallet address is already used by another user
+    const existingUser = await User.findOne({ 
+      walletAddress: normalizedWalletAddress,
+      _id: { $ne: req.user.id }
+    });
+    
+    if (existingUser) {
+      return res.status(400).json({ error: 'This wallet address is already connected to another account' });
+    }
+
+    // Update connected wallet address
+    user.connectedWalletAddress = normalizedWalletAddress;
+    await user.save();
+
+    res.json({
+      message: 'Wallet connected successfully',
+      connectedWalletAddress: user.connectedWalletAddress
+    });
+  } catch (error) {
+    console.error('Connect wallet error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// @route   POST /api/wallet/disconnect
+// @desc    Disconnect wallet address for email-logged users
+// @access  Private
+router.post('/disconnect', auth, async (req, res) => {
+  try {
+    // Get user
+    const user = await User.findById(req.user.id);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Only allow this for email-logged users (users with email)
+    if (!user.email) {
+      return res.status(400).json({ error: 'This endpoint is only for email-logged users' });
+    }
+
+    // Remove connected wallet address
+    user.connectedWalletAddress = undefined;
+    await user.save();
+
+    res.json({
+      message: 'Wallet disconnected successfully'
+    });
+  } catch (error) {
+    console.error('Disconnect wallet error:', error);
     res.status(500).json({ error: 'Server error' });
   }
 });

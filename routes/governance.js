@@ -11,6 +11,7 @@ const Job = require('../models/Job');
 const Order = require('../models/Order');
 const Chat = require('../models/Chat');
 const Message = require('../models/Message');
+const Config = require('../models/Config');
 
 // Configure multer for file uploads
 const uploadDir = path.join(__dirname, '../uploads/governance');
@@ -55,10 +56,24 @@ const upload = multer({
 
 const router = express.Router();
 
-const MIN_VOTE_ACTIVITY_POINTS = 9;
+// Helper function to get MIN_VOTE_ACTIVITY_POINTS from config
+const getMinVoteActivityPoints = async () => {
+  return await Config.getValue('min_activity_points_governance', 20);
+};
+
+const MIN_LOCKED_STAKING_LOB = 100; // Minimum 100 LOB locked staking required
 const MIN_PROPOSAL_ACTIVITY_POINTS = 10;
-const VOTING_DURATION_DAYS = 5;
 const MAX_LIST_LIMIT = 50;
+
+// Helper function to get voting duration days from config
+const getVotingDurationDays = async () => {
+  return await Config.getValue('voting_duration_days', 5);
+};
+
+// Helper function to get settlement percentage from config
+const getSettlementPercentage = async () => {
+  return await Config.getValue('settlement_percentage', 90);
+};
 
 const voteOptionLabels = {
   approve: 'Approve',
@@ -333,6 +348,9 @@ const buildProposalResponse = async (proposal, viewer, eligibleVoters = 0) => {
 
   const votingTimeRemainingMs = votingEnds ? getTimeRemaining(votingEnds) : 0;
 
+  // Get min activity points from config if not set in proposal
+  const minActivityPoints = proposal.voting?.minActivityPoints ?? await getMinVoteActivityPoints();
+
   return {
     _id: proposal._id,
     title: proposal.title,
@@ -348,8 +366,8 @@ const buildProposalResponse = async (proposal, viewer, eligibleVoters = 0) => {
     voting: {
       startsAt: proposal.voting?.startsAt,
       endsAt: proposal.voting?.endsAt,
-      durationDays: proposal.voting?.durationDays ?? VOTING_DURATION_DAYS,
-      minActivityPoints: proposal.voting?.minActivityPoints ?? MIN_VOTE_ACTIVITY_POINTS,
+      durationDays: proposal.voting?.durationDays ?? await getVotingDurationDays(),
+      minActivityPoints: minActivityPoints,
       finalDecision: proposal.voting?.finalDecision,
       finalizedAt: proposal.voting?.finalizedAt,
       autoFinalized: proposal.voting?.autoFinalized ?? false,
@@ -616,7 +634,10 @@ router.get(
           { $match: queryFilter },
           { $group: { _id: '$status', count: { $sum: 1 } } }
         ]),
-        User.countDocuments({ 'stats.activityPoints': { $gte: MIN_VOTE_ACTIVITY_POINTS } })
+        (async () => {
+          const minPoints = await getMinVoteActivityPoints();
+          return User.countDocuments({ 'stats.activityPoints': { $gte: minPoints } });
+        })()
       ]);
 
       await Promise.all(proposals.map((proposal) => finalizeProposalIfExpired(proposal)));
@@ -723,9 +744,10 @@ router.get(
         sortOptions['stats.activityPoints'] = -1;
       }
 
+      const minActivityPoints = await getMinVoteActivityPoints();
       const [leaders, total] = await Promise.all([
         User.find(
-          { 'stats.activityPoints': { $gte: MIN_VOTE_ACTIVITY_POINTS } },
+          { 'stats.activityPoints': { $gte: minActivityPoints } },
           {
             username: 1,
             email: 1,
@@ -740,7 +762,7 @@ router.get(
           .sort(sortOptions)
           .limit(limit)
           .skip((page - 1) * limit),
-        User.countDocuments({ 'stats.activityPoints': { $gte: MIN_VOTE_ACTIVITY_POINTS } })
+        User.countDocuments({ 'stats.activityPoints': { $gte: minActivityPoints } })
       ]);
 
       const leaderboard = leaders.map((member) => ({
@@ -779,12 +801,59 @@ router.get(
   }
 );
 
+// GET /api/governance/eligibility
+// Check voting eligibility (activity points + locked staking info)
+router.get('/eligibility', auth, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const activityPoints = user.stats?.activityPoints || 0;
+    const minActivityPoints = await getMinVoteActivityPoints();
+    const hasMinActivityPoints = activityPoints >= minActivityPoints;
+    
+    // Get minimum locked staking from config (default: 100)
+    const minLockedStaking = await Config.getValue('min_locked_staking_governance', 100);
+    
+    // Get voter reward amount from config
+    const voterRewardAmount = await Config.getValue('voter_reward_amount', 0);
+    
+    // Get voting duration and activity points for voting from config
+    const votingDurationDays = await getVotingDurationDays();
+    const activityPointsForVoting = await Config.getValue('activity_points_voting', 5);
+    
+    // Locked staking check must be done on frontend via blockchain
+    // Backend only checks activity points
+    res.json({
+      eligible: hasMinActivityPoints,
+      activityPoints: activityPoints,
+      requiredActivityPoints: minActivityPoints,
+      requiredLockedStaking: minLockedStaking,
+      voterRewardAmount: voterRewardAmount, // Include voter reward amount for frontend
+      votingDurationDays: votingDurationDays, // Include voting duration for frontend
+      activityPointsForVoting: activityPointsForVoting, // Include activity points earned per vote
+      message: hasMinActivityPoints 
+        ? `You meet activity points requirement. Please ensure you have ${minLockedStaking}+ LOB locked staking.`
+        : `You need ${minActivityPoints} activity points to vote. Current: ${activityPoints}`
+    });
+  } catch (error) {
+    console.error('[governance:eligibility] error', error);
+    res.status(500).json({ error: 'Unable to check eligibility' });
+  }
+});
+
 // GET /api/governance/eligible-work
 // This endpoint uses the SAME approach as /api/chats to fetch chats
 // but filters for workflowStatus: 'in-progress' or 'completed'
-router.get('/eligible-work', auth, ensureDaoProposalEligibility, async (req, res) => {
+// Note: No activity point requirement - anyone involved in jobs/gigs can see eligible work for disputes
+router.get('/eligible-work', auth, async (req, res) => {
   try {
-    const requester = req.daoUser;
+    const requester = await User.findById(req.user.id);
+    if (!requester) {
+      return res.status(404).json({ error: 'User not found' });
+    }
     // Use req.user.id (same as chats route) for consistency
     const userId = req.user.id;
 
@@ -1005,6 +1074,7 @@ router.get('/metrics/activity', auth, ensureDaoProposalEligibility, async (req, 
   try {
     const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
 
+    const minActivityPoints = await getMinVoteActivityPoints();
     const [activitySummaryRaw] = await User.aggregate([
       {
         $group: {
@@ -1015,7 +1085,7 @@ router.get('/metrics/activity', auth, ensureDaoProposalEligibility, async (req, 
           eligibleVoters: {
             $sum: {
               $cond: [
-                { $gte: ['$stats.activityPoints', MIN_VOTE_ACTIVITY_POINTS] },
+                { $gte: ['$stats.activityPoints', minActivityPoints] },
                 1,
                 0
               ]
@@ -1148,8 +1218,291 @@ router.get('/metrics/activity', auth, ensureDaoProposalEligibility, async (req, 
   }
 });
 
-// GET /api/governance/:id
-router.get('/:id', auth, async (req, res) => {
+// GET /api/governance/chat/:chatId/proposal
+// @desc    Check if chat has an active dispute proposal
+// @access  Private
+router.get('/chat/:chatId/proposal', auth, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const Proposal = require('../models/Proposal');
+    
+    // Find active dispute proposals that reference this chat
+    // For job disputes, the job field in disputeContext might be an application ID
+    // For gig disputes, the job field might be an order ID or chat ID
+    const activeProposals = await Proposal.find({
+      proposalType: 'dispute',
+      status: { $in: ['voting', 'awaiting_resolution'] },
+      isActive: { $ne: false },
+      $or: [
+        // Check if disputeContext.job references this chat (for Chat-based disputes)
+        { 'disputeContext.job': chatId },
+        // Also check if the jobModel is 'Chat' and jobId matches
+        { 
+          'disputeContext.jobModel': 'Chat',
+          'disputeContext.job': chatId
+        }
+      ]
+    })
+    .select('_id title status proposalType disputeContext')
+    .lean();
+    
+    // Also check if any job applications or orders linked to this chat have proposals
+    const chat = await Chat.findById(chatId)
+      .populate('job', '_id')
+      .populate('gig', '_id')
+      .lean();
+    
+    if (chat) {
+      // For jobs, check if any application has a proposal
+      if (chat.job) {
+        const Job = require('../models/Job');
+        const job = await Job.findById(chat.job._id || chat.job)
+          .select('applications')
+          .lean();
+        
+        if (job && job.applications) {
+          const applicationIds = job.applications.map(app => app._id.toString());
+          const jobProposals = await Proposal.find({
+            proposalType: 'dispute',
+            status: { $in: ['voting', 'awaiting_resolution'] },
+            isActive: { $ne: false },
+            'disputeContext.jobModel': 'Job',
+            'disputeContext.job': { $in: applicationIds }
+          })
+          .select('_id title status proposalType disputeContext')
+          .lean();
+          
+          activeProposals.push(...jobProposals);
+        }
+      }
+      
+      // For gigs, check if any order has a proposal
+      if (chat.gig) {
+        const Order = require('../models/Order');
+        const orders = await Order.find({
+          $or: [
+            { chat: chatId },
+            { gig: chat.gig._id || chat.gig }
+          ]
+        })
+        .select('_id')
+        .lean();
+        
+        if (orders.length > 0) {
+          const orderIds = orders.map(o => o._id.toString());
+          const orderProposals = await Proposal.find({
+            proposalType: 'dispute',
+            status: { $in: ['voting', 'awaiting_resolution'] },
+            isActive: { $ne: false },
+            'disputeContext.jobModel': 'Order',
+            'disputeContext.job': { $in: orderIds }
+          })
+          .select('_id title status proposalType disputeContext')
+          .lean();
+          
+          activeProposals.push(...orderProposals);
+        }
+      }
+    }
+    
+    // Deduplicate by proposal ID
+    const uniqueProposals = Array.from(
+      new Map(activeProposals.map(p => [p._id.toString(), p])).values()
+    );
+    
+    res.json({
+      hasActiveProposal: uniqueProposals.length > 0,
+      proposals: uniqueProposals,
+      proposalId: uniqueProposals.length > 0 ? uniqueProposals[0]._id.toString() : null
+    });
+  } catch (error) {
+    console.error('[governance:chat-proposal] Error:', error);
+    res.status(500).json({ error: 'Unable to check for proposals' });
+  }
+});
+
+// GET /api/governance/:id/contract-history
+// @desc Get contract status history and transactions for a dispute proposal
+// @access Public (everyone can view)
+// NOTE: This route must be defined BEFORE /:id to ensure proper matching
+router.get('/:id/contract-history', tryAuth, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ error: 'Invalid proposal id' });
+    }
+
+    const proposal = await Proposal.findById(req.params.id);
+    if (!proposal) {
+      return res.status(404).json({ error: 'Proposal not found' });
+    }
+
+    if (proposal.proposalType !== 'dispute') {
+      return res.status(400).json({ error: 'This endpoint is only for dispute proposals' });
+    }
+
+    const Transaction = require('../models/Transaction');
+    let chat = null;
+    const jobOrGigId = proposal.disputeContext?.job?._id || proposal.disputeContext?.job;
+
+    // Find the chat associated with this dispute
+    if (proposal.disputeContext?.jobModel === 'Chat') {
+      chat = await Chat.findById(jobOrGigId)
+        .populate('participants.user', 'username email profile')
+        .lean();
+    } else if (proposal.disputeContext?.jobModel === 'Order') {
+      const order = await Order.findById(jobOrGigId).select('chat').lean();
+      if (order?.chat) {
+        chat = await Chat.findById(order.chat)
+          .populate('participants.user', 'username email profile')
+          .lean();
+      }
+    } else if (proposal.disputeContext?.jobModel === 'Job') {
+      // For jobs, find chat by job ID
+      chat = await Chat.findOne({ job: jobOrGigId })
+        .populate('participants.user', 'username email profile')
+        .lean();
+    }
+
+    if (!chat) {
+      return res.json({
+        statusHistory: [],
+        transactions: []
+      });
+    }
+
+    // Build status history from chat escrow data
+    const statusHistory = [];
+    const { client, talent } = getParticipantsByRole(chat);
+
+    // Deposit status
+    if (chat.escrow?.deposit) {
+      statusHistory.push({
+        status: 'deposit',
+        label: 'Deposit',
+        performedBy: chat.escrow.deposit.performedBy,
+        performedByUser: client?.user || null,
+        role: 'client',
+        occurredAt: chat.escrow.deposit.occurredAt,
+        txHash: chat.escrow.deposit.txHash,
+        amountUSD: chat.escrow.deposit.amountUSD,
+        amountETH: chat.escrow.deposit.amountETH
+      });
+    }
+
+    // In-Progress status
+    if (chat.escrow?.inProgress) {
+      statusHistory.push({
+        status: 'in-progress',
+        label: 'In-Progress',
+        performedBy: chat.escrow.inProgress.performedBy,
+        performedByUser: talent?.user || null,
+        role: 'talent',
+        occurredAt: chat.escrow.inProgress.occurredAt,
+        txHash: chat.escrow.inProgress.txHash
+      });
+    }
+
+    // Completion status
+    if (chat.escrow?.completion) {
+      statusHistory.push({
+        status: 'completed',
+        label: 'Completed',
+        performedBy: chat.escrow.completion.performedBy,
+        performedByUser: talent?.user || null,
+        role: 'talent',
+        occurredAt: chat.escrow.completion.occurredAt,
+        txHash: chat.escrow.completion.txHash
+      });
+    }
+
+    // Confirmation status
+    if (chat.escrow?.confirmation) {
+      statusHistory.push({
+        status: 'confirmed',
+        label: 'Confirmed',
+        performedBy: chat.escrow.confirmation.performedBy,
+        performedByUser: client?.user || null,
+        role: 'client',
+        occurredAt: chat.escrow.confirmation.occurredAt,
+        txHash: chat.escrow.confirmation.txHash
+      });
+    }
+
+    // Sort by occurredAt
+    statusHistory.sort((a, b) => new Date(a.occurredAt) - new Date(b.occurredAt));
+
+    // Get current status
+    const currentStatus = chat.workflowStatus || 'offered';
+
+    // Fetch transactions related to this chat
+    const transactions = await Transaction.find({
+      chat: chat._id,
+      type: { $in: ['escrow_deposit', 'escrow_disburse'] }
+    })
+      .populate('fromUser', 'username email')
+      .populate('toUser', 'username email')
+      .sort({ createdAt: -1 })
+      .lean();
+
+    // Calculate remaining amount: deposit - total disbursed
+    let depositAmount = 0;
+    let totalDisbursed = 0;
+    
+    if (chat.escrow?.deposit?.amountUSD) {
+      depositAmount = chat.escrow.deposit.amountUSD;
+    }
+    
+    // Sum all disbursement transactions
+    transactions.forEach(tx => {
+      if (tx.type === 'escrow_disburse') {
+        totalDisbursed += tx.amount || 0;
+      }
+    });
+    
+    const remainingAmount = Math.max(0, depositAmount - totalDisbursed);
+
+    // Format transactions
+    const formattedTransactions = transactions.map(tx => ({
+      _id: tx._id,
+      type: tx.type,
+      amount: tx.amount,
+      currency: tx.currency || 'USD',
+      txHash: tx.txHash,
+      fromUser: tx.fromUser,
+      toUser: tx.toUser,
+      description: tx.description,
+      createdAt: tx.createdAt,
+      status: tx.status
+    }));
+
+    // Get settlement percentage from config
+    const settlementPercentage = await getSettlementPercentage();
+
+    res.json({
+      statusHistory,
+      currentStatus,
+      transactions: formattedTransactions,
+      remainingAmount,
+      depositAmount,
+      totalDisbursed,
+      settlementPercentage
+    });
+  } catch (error) {
+    console.error('[governance:contract-history] error', error);
+    res.status(500).json({ error: 'Unable to fetch contract history' });
+  }
+});
+
+// Helper function to get participants by role
+function getParticipantsByRole(chat) {
+  const client = chat.participants?.find((p) => p.role === 'client');
+  const talent = chat.participants?.find((p) => p.role === 'talent');
+  return { client, talent };
+}
+
+// GET /api/governance/:id (public - everyone can view)
+// NOTE: This route must be defined AFTER /:id/contract-history to ensure proper matching
+router.get('/:id', tryAuth, async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ error: 'Invalid proposal id' });
@@ -1161,9 +1514,11 @@ router.get('/:id', auth, async (req, res) => {
       return res.status(404).json({ error: 'Proposal not found' });
     }
 
-    const viewer = await User.findById(req.user.id);
+    // Try to get viewer if authenticated, otherwise use null
+    const viewer = req.user ? await User.findById(req.user.id) : null;
+    const minActivityPoints = await getMinVoteActivityPoints();
     const eligibleVoters = await User.countDocuments({
-      'stats.activityPoints': { $gte: MIN_VOTE_ACTIVITY_POINTS }
+      'stats.activityPoints': { $gte: minActivityPoints }
     });
 
     const response = await buildProposalResponse(proposal, viewer, eligibleVoters);
@@ -1195,13 +1550,15 @@ router.post(
         return res.status(404).json({ error: 'User not found' });
       }
 
-      if (!proposer.canCreateDaoProposal()) {
+      const { title, description, summary, proposalType, category, tags, platformDetails, disputeContext } = req.body;
+
+      // Only check activity points for platform proposals, not dispute proposals
+      // Dispute proposals can be created by anyone involved in the job/gig
+      if (proposalType === 'platform' && !proposer.canCreateDaoProposal()) {
         return res.status(403).json({
-          error: `Minimum ${MIN_PROPOSAL_ACTIVITY_POINTS} activity points required to create proposals`
+          error: `Minimum ${MIN_PROPOSAL_ACTIVITY_POINTS} activity points required to create platform proposals`
         });
       }
-
-      const { title, description, summary, proposalType, category, tags, platformDetails, disputeContext } = req.body;
 
       const baseProposal = new Proposal({
         title,
@@ -1213,9 +1570,9 @@ router.post(
         tags,
         voting: {
           startsAt: new Date(),
-          endsAt: new Date(Date.now() + VOTING_DURATION_DAYS * 24 * 60 * 60 * 1000),
-          durationDays: VOTING_DURATION_DAYS,
-          minActivityPoints: MIN_VOTE_ACTIVITY_POINTS,
+          endsAt: new Date(Date.now() + (await getVotingDurationDays()) * 24 * 60 * 60 * 1000),
+          durationDays: await getVotingDurationDays(),
+          minActivityPoints: await getMinVoteActivityPoints(),
           quorum: 0
         },
       status: 'voting',
@@ -1236,7 +1593,7 @@ router.post(
           return res.status(400).json({ error: 'Dispute proposals must include job reference' });
         }
 
-        // Support both 'Job'/'Order' and 'Chat' (for chat-based gig resolution)
+        // Support both 'Job'/'Order' and 'Chat' (for chat-based gig/job resolution)
         if (!['Job', 'Order', 'Chat'].includes(disputeContext.jobModel)) {
           return res.status(400).json({ error: 'Invalid dispute job model' });
         }
@@ -1244,7 +1601,7 @@ router.post(
         let workItem;
         let actualJobModel = disputeContext.jobModel;
 
-        // If jobModel is 'Chat', resolve to Order
+        // If jobModel is 'Chat', resolve to Order (for gigs) or Application (for jobs)
         if (disputeContext.jobModel === 'Chat') {
           // Find order linked to this chat
           const chatId = disputeContext.jobId;
@@ -1252,6 +1609,7 @@ router.post(
           
           const chat = await Chat.findById(chatId)
             .populate('gig', 'title talent')
+            .populate('job', 'title client applications')
             .populate('participants.user', 'username email profile')
             .lean();
 
@@ -1260,11 +1618,175 @@ router.post(
             return res.status(404).json({ error: 'Chat not found' });
           }
 
-          if (!chat.gig) {
-            console.log('[governance:create] Chat not associated with a gig:', chatId);
-            return res.status(404).json({ error: 'Chat not associated with a gig' });
-          }
-
+          // Handle job-based chats
+          if (chat.job) {
+            console.log('[governance:create] Chat associated with a job:', chat.job._id);
+            const jobId = chat.job._id || chat.job;
+            
+            // Find the application linked to this chat
+            const Job = require('../models/Job');
+            const job = await Job.findById(jobId)
+              .populate('client', 'username profile')
+              .populate('applications.talent', 'username profile')
+              .lean();
+            
+            if (!job) {
+              return res.status(404).json({ error: 'Job not found' });
+            }
+            
+            console.log('[governance:create] Job found:', {
+              jobId: job._id,
+              clientId: job.client?._id || job.client,
+              applicationsCount: job.applications?.length || 0,
+              chatId
+            });
+            
+            // Find the SPECIFIC application for this chat
+            // For jobs: The job creator (client) can dispute any application, OR a talent can dispute their own application
+            let application = null;
+            const proposerIdStr = proposer._id.toString();
+            const jobClientId = job.client?._id?.toString() || job.client?.toString();
+            const isProposerJobCreator = jobClientId === proposerIdStr;
+            
+            // Strategy 1: Find application by chatId
+            application = job.applications?.find(app => {
+              const appChatId = app.chatId?._id || app.chatId;
+              return appChatId && appChatId.toString() === chatId.toString();
+            });
+            
+            if (application) {
+              console.log('[governance:create] Application found by chatId:', application._id);
+            }
+            
+            // Strategy 2: If proposer is job creator, find application by chatId (any application)
+            if (!application && isProposerJobCreator) {
+              // Job creator can dispute any application linked to this chat
+              application = job.applications?.find(app => {
+                const appChatId = app.chatId?._id || app.chatId;
+                return appChatId && appChatId.toString() === chatId.toString();
+              });
+              
+              if (application) {
+                console.log('[governance:create] Application found for job creator by chatId:', application._id);
+              }
+            }
+            
+            // Strategy 3: Find application by proposer (talent) - talent can only dispute their own application
+            if (!application && !isProposerJobCreator) {
+              application = job.applications?.find(app => {
+                const appTalentId = app.talent?._id || app.talent;
+                const appTalentIdStr = appTalentId?.toString();
+                return appTalentIdStr === proposerIdStr;
+              });
+              
+              if (application) {
+                console.log('[governance:create] Application found by proposer (talent) ID:', application._id);
+              }
+            }
+            
+            // Strategy 4: Try to find by talent ID from chat participants
+            if (!application) {
+              const talentParticipant = chat.participants?.find(p => p.role === 'talent');
+              const talentId = talentParticipant?.user?._id || talentParticipant?.user;
+              
+              console.log('[governance:create] Application not found, trying by chat talent participant:', {
+                talentParticipantId: talentId,
+                proposerId: proposerIdStr,
+                isProposerJobCreator
+              });
+              
+              if (talentId) {
+                const matchingApp = job.applications?.find(app => {
+                  const appTalentId = app.talent?._id || app.talent;
+                  const match = appTalentId && appTalentId.toString() === talentId.toString();
+                  
+                  // If proposer is job creator, they can dispute any application
+                  // If proposer is talent, they can only dispute their own
+                  if (isProposerJobCreator) {
+                    return match; // Job creator can dispute any application
+                  } else {
+                    // Talent can only dispute their own application
+                    return match && appTalentId.toString() === proposerIdStr;
+                  }
+                });
+                
+                if (matchingApp) {
+                  application = matchingApp;
+                  console.log('[governance:create] Found application by chat talent participant');
+                }
+              }
+            }
+            
+            if (!application) {
+              console.error('[governance:create] Application not found:', {
+                chatId,
+                jobId: job._id,
+                proposerId: proposerIdStr,
+                isProposerJobCreator,
+                applications: job.applications?.map(app => ({
+                  appId: app._id,
+                  appChatId: app.chatId?._id || app.chatId,
+                  appTalentId: app.talent?._id || app.talent
+                }))
+              });
+              return res.status(404).json({ 
+                error: 'Application not found for this chat. Only the job creator or the talent who applied can create a dispute for a specific application.' 
+              });
+            }
+            
+            // Helper to extract ID - handles ObjectId, populated objects, and strings
+            const extractIdValue = (value) => {
+              if (!value) return null;
+              if (typeof value === 'string') return value;
+              if (value._id) return value._id.toString();
+              if (value.toString) return value.toString();
+              return null;
+            };
+            
+            // Extract talent ID - handle both populated and non-populated cases
+            const applicationTalentId = extractIdValue(application.talent);
+            
+            console.log('[governance:create] Application found:', {
+              applicationId: application._id,
+              applicationTalent: application.talent,
+              applicationTalentId: applicationTalentId,
+              applicationTalentType: typeof application.talent,
+              proposerId: proposer._id.toString(),
+              proposerUsername: proposer.username
+            });
+            
+            // Create a virtual work item from the application
+            // Ensure IDs are stored as strings for consistent comparison
+            workItem = {
+              _id: application._id,
+              job: job._id,
+              chat: chatId,
+              client: extractIdValue(job.client),
+              talent: applicationTalentId,
+              status: application.status || 'pending',
+              applicationNumber: `APP-${application._id.toString().slice(-8).toUpperCase()}`,
+              isApplicationBased: true,
+              jobTitle: job.title,
+              bidAmount: application.bidAmount,
+              estimatedDuration: application.estimatedDuration
+            };
+            actualJobModel = 'Job';
+            
+            console.log('[governance:create] Created workItem for job application:', {
+              applicationId: workItem._id,
+              jobId: job._id,
+              chatId,
+              clientId: workItem.client,
+              talentId: workItem.talent,
+              status: workItem.status,
+              proposerId: proposer._id.toString(),
+              proposerUsername: proposer.username,
+              willMatch: workItem.talent === proposer._id.toString()
+            });
+            
+            // Skip the gig order resolution logic - continue to set clientId and talentId
+          } else if (chat.gig) {
+            // Original gig handling logic
           const gigId = chat.gig._id || chat.gig;
           console.log('[governance:create] Chat found, gigId:', gigId);
           console.log('[governance:create] Chat participants:', chat.participants?.map(p => ({
@@ -1280,10 +1802,11 @@ router.post(
             return pid?.toString() || pid;
           }) || [];
 
-          // Find order for this chat - try multiple strategies
+          // Find the SPECIFIC order for this chat where the proposer is a participant
+          // For gigs: A client who ordered can dispute their order, OR the talent (gig creator) can dispute any order
           let order = null;
 
-          // Strategy 1: Find order by chat field
+          // Strategy 1: Find order by chat field where proposer is participant
           order = await Order.findOne({
             chat: chatId,
             $or: [{ client: proposer._id }, { talent: proposer._id }]
@@ -1294,41 +1817,11 @@ router.post(
             .populate('gig.talent', 'username profile')
             .lean();
 
-          console.log('[governance:create] Order found by chat field:', order ? order._id : 'none');
+          console.log('[governance:create] Order found by chat field (proposer participant):', order ? order._id : 'none');
 
-          // Strategy 2: Find order by gig and chat participants (try each participant ID individually)
-          if (!order && chatParticipantIds.length > 0) {
-            // Try each participant as client or talent
-            for (const participantId of chatParticipantIds) {
-              const participantObjId = mongoose.Types.ObjectId.isValid(participantId) 
-                ? new mongoose.Types.ObjectId(participantId) 
-                : participantId;
-              
-              order = await Order.findOne({
-                gig: gigId,
-                $or: [{ client: participantObjId }, { talent: participantObjId }]
-              })
-                .populate('client', 'username profile')
-                .populate('talent', 'username profile')
-                .populate('gig', 'title talent')
-                .populate('gig.talent', 'username profile')
-                .sort({ createdAt: -1 })
-                .lean();
-
-              if (order) {
-                console.log('[governance:create] Order found by gig and participant:', order._id, 'participant:', participantId);
-                break;
-              }
-            }
-
-            if (!order) {
-              console.log('[governance:create] No order found by gig and participants');
-            }
-          }
-
-          // Strategy 3: Find any order for this gig where proposer is participant
+          // Strategy 2: Find order by gig and proposer (if chat field not set)
           if (!order) {
-            const gigOrders = await Order.find({
+            order = await Order.findOne({
               gig: gigId,
               $or: [{ client: proposer._id }, { talent: proposer._id }]
             })
@@ -1339,39 +1832,42 @@ router.post(
               .sort({ createdAt: -1 })
               .lean();
 
-            console.log('[governance:create] Orders found for gig (proposer participant):', gigOrders.length);
-            gigOrders.forEach((o, idx) => {
-              console.log(`  ${idx + 1}. Order ${o._id}: client=${o.client?._id}, talent=${o.talent?._id}, chat=${o.chat || 'none'}`);
-            });
-
-            if (gigOrders.length > 0) {
-              order = gigOrders[0];
-            }
+            console.log('[governance:create] Order found by gig and proposer:', order ? order._id : 'none');
           }
 
-          // Strategy 4: Find any order for this gig (last resort)
-          if (!order) {
-            const allGigOrders = await Order.find({ gig: gigId })
-              .populate('client', 'username profile')
-              .populate('talent', 'username profile')
-              .populate('gig', 'title talent')
-              .populate('gig.talent', 'username profile')
-              .sort({ createdAt: -1 })
-              .limit(1)
-              .lean();
+          // Strategy 3: Find order by chat participants (if proposer is one of the chat participants)
+          if (!order && chatParticipantIds.length > 0) {
+            const proposerIdStr = proposer._id.toString();
+            if (chatParticipantIds.includes(proposerIdStr)) {
+              // Find order where one of the chat participants is the client or talent
+              for (const participantId of chatParticipantIds) {
+                const participantObjId = mongoose.Types.ObjectId.isValid(participantId) 
+                  ? new mongoose.Types.ObjectId(participantId) 
+                  : participantId;
+                
+                order = await Order.findOne({
+                  gig: gigId,
+                  $or: [{ client: participantObjId }, { talent: participantObjId }]
+                })
+                  .populate('client', 'username profile')
+                  .populate('talent', 'username profile')
+                  .populate('gig', 'title talent')
+                  .populate('gig.talent', 'username profile')
+                  .sort({ createdAt: -1 })
+                  .lean();
 
-            console.log('[governance:create] All orders for gig (any participant):', allGigOrders.length);
-            if (allGigOrders.length > 0) {
-              order = allGigOrders[0];
-              // Check if proposer is participant
-              const isProposerClient = order.client?._id?.toString() === proposer._id.toString() || 
-                                      order.client?.toString() === proposer._id.toString();
-              const isProposerTalent = order.talent?._id?.toString() === proposer._id.toString() || 
-                                      order.talent?.toString() === proposer._id.toString();
-              
-              if (!isProposerClient && !isProposerTalent) {
-                console.log('[governance:create] Proposer is not participant of found order');
-                order = null;
+                if (order) {
+                  // Verify proposer is actually a participant of this order
+                  const orderClientId = order.client?._id?.toString() || order.client?.toString();
+                  const orderTalentId = order.talent?._id?.toString() || order.talent?.toString();
+                  
+                  if (orderClientId === proposerIdStr || orderTalentId === proposerIdStr) {
+                    console.log('[governance:create] Order found by chat participant:', order._id);
+                    break;
+                  } else {
+                    order = null; // Proposer is not a participant of this order
+                  }
+                }
               }
             }
           }
@@ -1403,7 +1899,7 @@ router.post(
             // If there are orders but we couldn't match, provide more specific error
             if (totalOrdersForGig > 0) {
               return res.status(404).json({ 
-                error: `Found ${totalOrdersForGig} order(s) for this gig, but you are not a participant. Only the client or talent of an order can create a dispute.` 
+                error: `Found ${totalOrdersForGig} order(s) for this gig, but you are not a participant of the order linked to this chat. Only the client who placed the order or the talent (gig creator) for this specific order can create a dispute.` 
               });
             }
             
@@ -1484,45 +1980,314 @@ router.post(
               talentId: workItem.talent
             });
           }
+          }
         } else {
-          // Normal Job or Order lookup
-          const Model = disputeContext.jobModel === 'Job' ? Job : Order;
+          // Normal Job or Order lookup (when jobModel is 'Job' or 'Order' directly, not 'Chat')
+          if (disputeContext.jobModel === 'Job') {
+            // For Job model, the jobId could be either a chatId or a jobId
+            // First try to find chat by jobId (in case it's actually a chatId)
+            // Then try to find chat by job reference
+            const Job = require('../models/Job');
+            const jobIdOrChatId = disputeContext.jobId;
+            
+            console.log('[governance:create] Job model lookup, jobIdOrChatId:', jobIdOrChatId);
+            
+            // First try to find chat directly by ID (in case jobId is actually a chatId)
+            let chat = await Chat.findById(jobIdOrChatId)
+              .populate('job', 'title client applications')
+              .populate('participants.user', 'username email profile')
+              .lean();
+            
+            // If chat not found by ID, try to find chat by job reference and proposer
+            if (!chat || !chat.job) {
+              console.log('[governance:create] Chat not found by ID, trying to find by job and proposer');
+              const job = await Job.findById(jobIdOrChatId)
+                .populate('client', 'username profile')
+                .lean();
+              
+              if (job) {
+                // Find chat that links to this job and involves the proposer
+                chat = await Chat.findOne({
+                  job: job._id,
+                  'participants.user': proposer._id
+                })
+                  .populate('job', 'title client applications')
+                  .populate('participants.user', 'username email profile')
+                  .lean();
+                
+                console.log('[governance:create] Found chat by job and proposer:', {
+                  chatId: chat?._id,
+                  jobId: job._id,
+                  proposerId: proposer._id.toString()
+                });
+              }
+            }
+            
+            if (chat && chat.job) {
+              const job = await Job.findById(chat.job._id || chat.job)
+                .populate('client', 'username profile')
+                .populate('applications.talent', 'username profile')
+                .lean();
+              
+              if (job) {
+                // Find application by chatId
+                let application = job.applications?.find(app => {
+                  const appChatId = app.chatId?._id || app.chatId;
+                  return appChatId && appChatId.toString() === chat._id.toString();
+                });
+                
+                // If not found by chatId, try by talent from chat participants
+                if (!application) {
+                  const talentParticipant = chat.participants?.find(p => p.role === 'talent');
+                  const talentId = talentParticipant?.user?._id || talentParticipant?.user;
+                  
+                  if (talentId) {
+                    application = job.applications?.find(app => {
+                      const appTalentId = app.talent?._id || app.talent;
+                      return appTalentId && appTalentId.toString() === talentId.toString();
+                    });
+                  }
+                }
+                
+                if (application) {
+                  // Helper to extract ID - handles ObjectId, populated objects, and strings
+                  const extractIdValue = (value) => {
+                    if (!value) return null;
+                    if (typeof value === 'string') return value;
+                    if (value._id) return value._id.toString();
+                    if (value.toString) return value.toString();
+                    return null;
+                  };
+                  
+                  const applicationTalentId = extractIdValue(application.talent);
+                  
+                  console.log('[governance:create] Found application (Job model path):', {
+                    applicationId: application._id,
+                    applicationTalentId: applicationTalentId,
+                    proposerId: proposer._id.toString(),
+                    willMatch: applicationTalentId === proposer._id.toString()
+                  });
+                  
+                  workItem = {
+                    _id: application._id,
+                    job: job._id,
+                    chat: chat._id,
+                    client: extractIdValue(job.client),
+                    talent: applicationTalentId,
+                    status: application.status || 'pending',
+                    applicationNumber: `APP-${application._id.toString().slice(-8).toUpperCase()}`,
+                    isApplicationBased: true,
+                    jobTitle: job.title,
+                    bidAmount: application.bidAmount,
+                    estimatedDuration: application.estimatedDuration
+                  };
+                  actualJobModel = 'Job';
+                  
+                  console.log('[governance:create] Created workItem (Job model path):', {
+                    workItemId: workItem._id,
+                    clientId: workItem.client,
+                    talentId: workItem.talent,
+                    proposerId: proposer._id.toString()
+                  });
+                } else {
+                  console.error('[governance:create] Application not found for chat:', {
+                    chatId,
+                    jobId: job._id,
+                    applications: job.applications?.map(app => ({
+                      appId: app._id,
+                      appChatId: app.chatId?._id || app.chatId,
+                      appTalentId: app.talent?._id || app.talent
+                    }))
+                  });
+                  return res.status(404).json({ error: 'Application not found for this chat' });
+                }
+              } else {
+                return res.status(404).json({ error: 'Job not found' });
+              }
+            } else {
+              // If jobId is actually a job ID (not chatId), find the job directly
+              // This is a fallback - should not happen in normal flow
+              console.log('[governance:create] Chat not found, trying direct job lookup:', disputeContext.jobId);
+              const job = await Job.findById(disputeContext.jobId)
+                .populate('client', 'username profile')
+                .populate('applications.talent', 'username profile')
+                .lean();
+              
+              if (!job) {
+                return res.status(404).json({ error: 'Job not found' });
+              }
+              
+              // Find the specific application
+              // Job creator can dispute any application, talent can only dispute their own
+              const proposerIdStr = proposer._id.toString();
+              const jobClientId = job.client?._id?.toString() || job.client?.toString();
+              const isProposerJobCreator = jobClientId === proposerIdStr;
+              
+              let application = null;
+              
+              if (isProposerJobCreator) {
+                // Job creator can dispute any application - find by jobIdOrChatId if it's a chatId
+                // or use the first application if it's a jobId
+                if (mongoose.Types.ObjectId.isValid(disputeContext.jobId)) {
+                  // Try to find application by chatId first
+                  application = job.applications?.find(app => {
+                    const appChatId = app.chatId?._id || app.chatId;
+                    return appChatId && appChatId.toString() === disputeContext.jobId;
+                  });
+                  
+                  // If not found by chatId, use first application (job creator can dispute any)
+                  if (!application && job.applications?.length > 0) {
+                    application = job.applications[0];
+                  }
+                }
+              } else {
+                // Talent can only dispute their own application
+                application = job.applications?.find(app => {
+                  const appTalentId = app.talent?._id || app.talent;
+                  return appTalentId && appTalentId.toString() === proposerIdStr;
+                });
+              }
+              
+              if (application) {
+                const extractIdValue = (value) => {
+                  if (!value) return null;
+                  if (typeof value === 'string') return value;
+                  if (value._id) return value._id.toString();
+                  if (value.toString) return value.toString();
+                  return null;
+                };
+                
+                workItem = {
+                  _id: application._id,
+                  job: job._id,
+                  client: extractIdValue(job.client),
+                  talent: extractIdValue(application.talent),
+                  status: application.status || 'pending',
+                  applicationNumber: `APP-${application._id.toString().slice(-8).toUpperCase()}`,
+                  isApplicationBased: true,
+                  jobTitle: job.title,
+                  bidAmount: application.bidAmount,
+                  estimatedDuration: application.estimatedDuration
+                };
+                actualJobModel = 'Job';
+              } else {
+                // No application found - return error
+                return res.status(404).json({ 
+                  error: isProposerJobCreator 
+                    ? 'No application found for this job. Please select a specific application to dispute.'
+                    : 'Application not found. You can only dispute your own application for this job.'
+                });
+              }
+            }
+          } else {
+            // Order lookup
+            const Model = Order;
           workItem = await Model.findById(disputeContext.jobId)
             .populate('client', 'username profile')
-            .populate('hiredTalent', 'username profile')
             .populate('talent', 'username profile')
             .populate('gig', 'title talent')
             .populate('gig.talent', 'username profile');
 
           if (!workItem) {
-            return res.status(404).json({ error: 'Referenced job or gig not found' });
+              return res.status(404).json({ error: 'Referenced order not found' });
+            }
+            actualJobModel = 'Order';
           }
         }
 
         let clientId;
         let talentId;
 
+        // Helper function to extract ID from various formats
+        const extractId = (value) => {
+          if (!value) return null;
+          if (typeof value === 'string') return value;
+          if (value._id) return value._id.toString();
+          if (value.toString) return value.toString();
+          return null;
+        };
+
         if (actualJobModel === 'Job') {
-          clientId = workItem.client?._id || workItem.client;
-          talentId = workItem.hiredTalent?._id || workItem.hiredTalent;
+          // For job applications:
+          // - clientId: The job creator (job.client)
+          // - talentId: The talent who applied (application.talent)
+          // Either the job creator OR the applicant can submit a dispute
+          clientId = extractId(workItem.client);
+          talentId = extractId(workItem.talent); // This is the application's talent
         } else if (actualJobModel === 'Chat') {
-          // For Chat-based disputes, client and talent are already set in workItem
-          clientId = workItem.client;
-          talentId = workItem.talent;
+          // For Chat-based disputes (fallback when no order/application found)
+          // client and talent are already set in workItem from chat participants
+          clientId = extractId(workItem.client);
+          talentId = extractId(workItem.talent);
         } else {
-          // Order case
-          clientId = workItem.client?._id || workItem.client;
-          talentId = workItem.talent?._id || workItem.talent || workItem.gig?.talent?._id;
+          // Order case (for gigs):
+          // - clientId: The client who made the order (order.client)
+          // - talentId: The talent (gig creator) (order.talent)
+          // Either the client who ordered OR the talent (gig creator) can submit a dispute
+          clientId = extractId(workItem.client);
+          talentId = extractId(workItem.talent); // order.talent is the gig creator
         }
 
         const proposerIdStr = proposer._id.toString();
-        const isParticipant = [clientId?.toString(), talentId?.toString()].includes(proposerIdStr);
+
+        console.log('[governance:create] Participant check:', {
+          proposerId: proposerIdStr,
+          proposerUsername: proposer.username,
+          clientId: clientId,
+          talentId: talentId,
+          actualJobModel,
+          workItemClient: workItem.client,
+          workItemTalent: workItem.talent,
+          workItemType: typeof workItem.client,
+          workItemTalentType: typeof workItem.talent,
+          isClient: clientId && clientId === proposerIdStr,
+          isTalent: talentId && talentId === proposerIdStr
+        });
+
+        const isClient = clientId && clientId === proposerIdStr;
+        const isTalent = talentId && talentId === proposerIdStr;
+        const isParticipant = isClient || isTalent;
 
         if (!isParticipant) {
+          const errorMessage = actualJobModel === 'Job' 
+            ? 'Only participants of the job application can initiate a dispute. You must be either the job creator (client) or the talent who applied for this specific job application.'
+            : actualJobModel === 'Order'
+            ? 'Only participants of the gig order can initiate a dispute. You must be either the client who placed this order or the talent (gig creator) for this specific order.'
+            : 'Only participants of the job or gig can initiate a dispute. You must be either the client or the talent involved.';
+          
+          console.error('[governance:create] Participant check failed:', {
+            proposerId: proposerIdStr,
+            proposerUsername: proposer.username,
+            proposerRole: proposer.role,
+            clientId: clientId,
+            talentId: talentId,
+            workItem: {
+              _id: workItem._id,
+              client: workItem.client,
+              talent: workItem.talent,
+              clientType: typeof workItem.client,
+              talentType: typeof workItem.talent
+            },
+            actualJobModel,
+            comparison: {
+              clientMatch: clientId === proposerIdStr,
+              talentMatch: talentId === proposerIdStr,
+              clientIdType: typeof clientId,
+              talentIdType: typeof talentId,
+              proposerIdType: typeof proposerIdStr
+            }
+          });
           return res.status(403).json({
-            error: 'Only participants of the job or gig can initiate a dispute'
+            error: errorMessage
           });
         }
+
+        console.log('[governance:create] Participant check passed:', {
+          proposerId: proposerIdStr,
+          isClient,
+          isTalent,
+          actualJobModel
+        });
 
         baseProposal.disputeContext = {
           job: workItem._id,
@@ -1552,8 +2317,9 @@ router.post(
       );
 
       const hydrated = await withFinalizedProposal(baseProposal._id);
+      const minActivityPoints = await getMinVoteActivityPoints();
       const eligibleVoters = await User.countDocuments({
-        'stats.activityPoints': { $gte: MIN_VOTE_ACTIVITY_POINTS }
+        'stats.activityPoints': { $gte: minActivityPoints }
       });
 
       const response = await buildProposalResponse(hydrated, proposer, eligibleVoters);
@@ -1588,9 +2354,10 @@ router.post(
         return res.status(404).json({ error: 'User not found' });
       }
 
+      const minActivityPoints = await getMinVoteActivityPoints();
       if (!voter.canVote()) {
         return res.status(403).json({
-          error: `Minimum ${MIN_VOTE_ACTIVITY_POINTS} activity points required to vote`
+          error: `Minimum ${minActivityPoints} activity points required to vote`
         });
     }
 
@@ -1619,7 +2386,7 @@ router.post(
         // Return the current proposal state so frontend can display the user's vote
         const refreshed = await withFinalizedProposal(proposal._id);
         const eligibleVoters = await User.countDocuments({
-          'stats.activityPoints': { $gte: MIN_VOTE_ACTIVITY_POINTS }
+          'stats.activityPoints': { $gte: minActivityPoints }
         });
         
         return res.status(400).json({ 
@@ -1637,17 +2404,29 @@ router.post(
       proposal.recalculateTallies();
     await proposal.save();
 
-      await voter.addActivityPoints(5);
+      // Get activity points from config (default: 5)
+      const Config = require('../models/Config');
+      const activityPoints = await Config.getValue('activity_points_voting', 5);
+      await voter.addActivityPoints(activityPoints);
       await voter.incrementDaoStat('votesCast');
 
       const refreshed = await withFinalizedProposal(proposal._id);
       const eligibleVoters = await User.countDocuments({
-        'stats.activityPoints': { $gte: MIN_VOTE_ACTIVITY_POINTS }
+        'stats.activityPoints': { $gte: minActivityPoints }
       });
 
+      // Calculate vote power: votes cast + activity points + locked tokens (locked tokens checked on frontend)
+      const votePower = (voter.stats?.dao?.votesCast || 0) + voter.stats?.activityPoints || 0;
+      
+      // Get voter reward amount from config (stored in backend, not contract)
+      const voterRewardAmount = await Config.getValue('voter_reward_amount', 0);
+      
       res.json({
-        message: 'Vote recorded successfully',
-        proposal: await buildProposalResponse(refreshed, voter, eligibleVoters)
+        message: 'Vote recorded successfully. You can now claim your voter reward.',
+        proposal: await buildProposalResponse(refreshed, voter, eligibleVoters),
+        votePower: votePower,
+        shouldClaimReward: voterRewardAmount > 0, // Only claim if reward amount is set
+        voterRewardAmount: voterRewardAmount // Return the reward amount from config
       });
   } catch (error) {
       console.error('[governance:vote] error', error);
@@ -1674,9 +2453,10 @@ router.post(
         return res.status(404).json({ error: 'User not found' });
       }
 
+      const minActivityPoints = await getMinVoteActivityPoints();
       if (!viewer.canVote()) {
         return res.status(403).json({
-          error: `Only DAO members with ${MIN_VOTE_ACTIVITY_POINTS}+ activity points can comment`
+          error: `Only DAO members with ${minActivityPoints}+ activity points can comment`
         });
       }
 
@@ -1713,7 +2493,7 @@ router.post(
 
       const refreshed = await withFinalizedProposal(proposal._id);
       const eligibleVoters = await User.countDocuments({
-        'stats.activityPoints': { $gte: MIN_VOTE_ACTIVITY_POINTS }
+        'stats.activityPoints': { $gte: minActivityPoints }
       });
 
       const response = await buildProposalResponse(refreshed, viewer, eligibleVoters);
@@ -1748,9 +2528,10 @@ router.post(
         return res.status(404).json({ error: 'User not found' });
       }
 
+      const minActivityPoints = await getMinVoteActivityPoints();
       if (!member.canVote()) {
         return res.status(403).json({
-          error: `Minimum ${MIN_VOTE_ACTIVITY_POINTS}+ activity points required for DAO messaging`
+          error: `Minimum ${minActivityPoints}+ activity points required for DAO messaging`
         });
       }
 
@@ -1789,7 +2570,7 @@ router.post(
 
       const refreshed = await withFinalizedProposal(proposal._id);
       const eligibleVoters = await User.countDocuments({
-        'stats.activityPoints': { $gte: MIN_VOTE_ACTIVITY_POINTS }
+        'stats.activityPoints': { $gte: minActivityPoints }
       });
 
       res.status(201).json(buildProposalResponse(refreshed, member, eligibleVoters));
@@ -1808,9 +2589,10 @@ router.post('/:id/resolve', auth, async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
+    const minActivityPoints = await getMinVoteActivityPoints();
     if (!resolver.canVote()) {
       return res.status(403).json({
-        error: `Minimum ${MIN_VOTE_ACTIVITY_POINTS}+ activity points required to resolve proposals`
+        error: `Minimum ${minActivityPoints}+ activity points required to resolve proposals`
       });
     }
 
@@ -1832,30 +2614,254 @@ router.post('/:id/resolve', auth, async (req, res) => {
       return res.status(400).json({ error: 'Proposal already resolved' });
     }
 
+    // For dispute proposals, calculate settlement amounts and return contract call data
+    let resolveDisputeData = null;
+    if (proposal.proposalType === 'dispute') {
+      // Get chat to extract wallet addresses from escrow transactions
+      let chat = null;
+      let clientWalletAddress = null;
+      let talentWalletAddress = null;
+      
+      if (proposal.disputeContext.jobModel === 'Chat') {
+        chat = await Chat.findById(proposal.disputeContext.job);
+        
+        if (chat?.escrow) {
+          // Get client wallet from deposit transaction (client deposits)
+          if (chat.escrow.deposit?.fromAddress) {
+            clientWalletAddress = chat.escrow.deposit.fromAddress.toLowerCase();
+          }
+          
+          // Get talent wallet from in-progress transaction (talent signs in-progress)
+          // Or from completion transaction, or from deposit toAddress
+          if (chat.escrow.inProgress?.fromAddress) {
+            talentWalletAddress = chat.escrow.inProgress.fromAddress.toLowerCase();
+          } else if (chat.escrow.completion?.fromAddress) {
+            talentWalletAddress = chat.escrow.completion.fromAddress.toLowerCase();
+          } else if (chat.escrow.deposit?.toAddress) {
+            talentWalletAddress = chat.escrow.deposit.toAddress.toLowerCase();
+          }
+        }
+      }
+      
+      // Fallback to user profile wallet addresses if not found in escrow
+      if (!clientWalletAddress) {
+        const clientUser = await User.findById(proposal.disputeContext.client);
+        clientWalletAddress = clientUser?.walletAddress || clientUser?.connectedWalletAddress;
+        if (clientWalletAddress) {
+          clientWalletAddress = clientWalletAddress.toLowerCase();
+        }
+      }
+      
+      if (!talentWalletAddress) {
+        const talentUser = await User.findById(proposal.disputeContext.talent);
+        talentWalletAddress = talentUser?.walletAddress || talentUser?.connectedWalletAddress;
+        if (talentWalletAddress) {
+          talentWalletAddress = talentWalletAddress.toLowerCase();
+        }
+      }
+      
+      if (!clientWalletAddress || !talentWalletAddress) {
+        return res.status(400).json({ 
+          error: 'Client or talent wallet address not found. Please ensure both parties have completed escrow transactions (deposit and in-progress) or have connected wallets in their profile.' 
+        });
+      }
+
+      // Get remaining amount from contract history (chat already loaded above)
+      let remainingAmountUSD = 0;
+      if (chat?.escrow?.deposit?.amountUSD) {
+        const totalDisbursed = chat.escrow.disbursements?.reduce((sum, d) => sum + (d.amountUSD || 0), 0) || 0;
+        remainingAmountUSD = chat.escrow.deposit.amountUSD - totalDisbursed;
+      }
+
+      // Get settlement percentage from config
+      const Config = require('../models/Config');
+      const settlementPercentage = parseFloat(await Config.getValue('settlement_percentage')) || 90;
+      const maxSettlementAmountUSD = remainingAmountUSD * (settlementPercentage / 100);
+
+      let clientAmountUSD = 0;
+      let talentAmountUSD = 0;
+      let resolutionType = 'voting_outcome';
+
+      // Check if there's a mutual agreement (both parties approved settlement)
+      const settlement = proposal.disputeContext?.settlement;
+      if (settlement?.clientApproved && settlement?.talentApproved && 
+          settlement.talentAmount !== null && settlement.talentAmount !== undefined &&
+          settlement.clientAmount !== null && settlement.clientAmount !== undefined) {
+        // Use settlement amounts from mutual agreement
+        clientAmountUSD = settlement.clientAmount || 0;
+        talentAmountUSD = settlement.talentAmount || 0;
+        resolutionType = 'mutual_agreement';
+      } else {
+        // Calculate amounts based on voting outcome
+        const finalDecision = proposal.voting?.finalDecision || 'split_funds'; // Default to split if no decision
+        
+        if (finalDecision === 'client_refund') {
+          clientAmountUSD = maxSettlementAmountUSD;
+          talentAmountUSD = 0;
+        } else if (finalDecision === 'talent_refund') {
+          clientAmountUSD = 0;
+          talentAmountUSD = maxSettlementAmountUSD;
+        } else {
+          // split_funds or no votes (equal split)
+          clientAmountUSD = maxSettlementAmountUSD / 2;
+          talentAmountUSD = maxSettlementAmountUSD / 2;
+        }
+      }
+
+      // Convert USD to ETH
+      const ethPriceUsd = parseFloat(process.env.ETH_PRICE_USD || 3000);
+      const minAmountETH = 0.000005; // Minimum $1 USD in ETH (approximately)
+      
+      let clientAmountETH = clientAmountUSD > 0 
+        ? clientAmountUSD / ethPriceUsd 
+        : minAmountETH;
+      let talentAmountETH = talentAmountUSD > 0
+        ? talentAmountUSD / ethPriceUsd
+        : minAmountETH;
+
+      // Ensure minimum amounts (contract requires minimum if amount > 0)
+      if (clientAmountUSD > 0 && clientAmountETH < minAmountETH) {
+        clientAmountETH = minAmountETH;
+      }
+      if (talentAmountUSD > 0 && talentAmountETH < minAmountETH) {
+        talentAmountETH = minAmountETH;
+      }
+
+      // If amount is 0, set to 0 (don't use minimum)
+      if (clientAmountUSD === 0) {
+        clientAmountETH = 0;
+      }
+      if (talentAmountUSD === 0) {
+        talentAmountETH = 0;
+      }
+
+      resolveDisputeData = {
+        clientWalletAddress,
+        talentWalletAddress,
+        clientAmountETH,
+        talentAmountETH,
+        shouldCallContract: !!(clientWalletAddress && talentWalletAddress),
+        resolutionType,
+        finalDecision: proposal.voting?.finalDecision || 'split_funds',
+        clientAmountUSD,
+        talentAmountUSD
+      };
+    }
+
+    // Don't save yet - wait for contract call to succeed
+    // Return data for frontend to call contract first
+    res.json({
+      message: proposal.proposalType === 'dispute' 
+        ? 'Ready to resolve dispute. Please confirm contract transaction.' 
+        : 'Proposal ready to resolve',
+      resolveDisputeData,
+      proposalId: proposal._id.toString()
+    });
+  } catch (error) {
+    console.error('[governance:resolve] error', error);
+    res.status(500).json({ error: 'Unable to resolve proposal' });
+  }
+});
+
+// POST /api/governance/:id/resolve/confirm
+// Confirm resolution after successful contract call
+router.post('/:id/resolve/confirm', auth, async (req, res) => {
+  try {
+    const resolver = await User.findById(req.user.id);
+    if (!resolver) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const minActivityPoints = await getMinVoteActivityPoints();
+    if (!resolver.canVote()) {
+      return res.status(403).json({
+        error: `Minimum ${minActivityPoints}+ activity points required to resolve proposals`
+      });
+    }
+
+    const proposal = await Proposal.findById(req.params.id);
+    if (!proposal) {
+      return res.status(404).json({ error: 'Proposal not found' });
+    }
+
+    if (proposal.resolution?.resolvedAt) {
+      return res.status(400).json({ error: 'Proposal already resolved' });
+    }
+
+    // Verify contract transaction hash if provided
+    const { txHash } = req.body;
+    if (proposal.proposalType === 'dispute' && !txHash) {
+      return res.status(400).json({ error: 'Transaction hash required for dispute resolution' });
+    }
+
     proposal.status = 'resolved';
     if (!proposal.resolution) {
       proposal.resolution = {};
     }
     proposal.resolution.resolvedBy = resolver._id;
     proposal.resolution.resolvedAt = new Date();
+    
+    // For disputes, set outcome based on resolution type
+    if (proposal.proposalType === 'dispute') {
+      const { resolutionType, finalDecision, clientAmountUSD, talentAmountUSD } = req.body;
+      
+      // Check if there's a mutual agreement
+      const settlement = proposal.disputeContext?.settlement;
+      if (settlement?.clientApproved && settlement?.talentApproved && resolutionType === 'mutual_agreement') {
+        proposal.resolution.outcome = 'split_funds'; // Settlement is essentially a split
+        proposal.resolution.summary = `Dispute resolved by mutual agreement. Client: $${clientAmountUSD || 0}, Talent: $${talentAmountUSD || 0}`;
+        proposal.disputeContext.settlement.settledByAgreement = true;
+        proposal.disputeContext.settlement.resolvedBy = resolver._id;
+        proposal.disputeContext.settlement.resolvedAt = new Date();
+      } else {
+        // Voting outcome
+        const decision = finalDecision || proposal.voting?.finalDecision || 'split_funds';
+        proposal.resolution.outcome = decision;
+        
+        // Create summary
+        if (decision === 'client_refund') {
+          proposal.resolution.summary = 'Dispute resolved: Full refund to client based on voting outcome.';
+        } else if (decision === 'talent_refund') {
+          proposal.resolution.summary = 'Dispute resolved: Full refund to talent based on voting outcome.';
+        } else {
+          proposal.resolution.summary = 'Dispute resolved: Funds split equally between client and talent based on voting outcome.';
+        }
+      }
+      
+      if (txHash) {
+        proposal.resolution.notes = `Resolved via DAO contract. Transaction: ${txHash}`;
+      }
+    }
 
-  await proposal.save();
+    await proposal.save();
+    
     if (proposal.proposalType === 'dispute') {
       await resolver.incrementDaoStat('disputesResolved');
     }
 
     const hydrated = await withFinalizedProposal(proposal._id);
     const eligibleVoters = await User.countDocuments({
-      'stats.activityPoints': { $gte: MIN_VOTE_ACTIVITY_POINTS }
+      'stats.activityPoints': { $gte: minActivityPoints }
     });
+
+    const proposalResponse = await buildProposalResponse(hydrated, resolver, eligibleVoters);
+
+    // Emit socket event for real-time updates
+    const io = req.app.get('io');
+    if (io) {
+      io.emit('proposal:updated', {
+        proposalId: proposal._id.toString(),
+        proposal: proposalResponse
+      });
+    }
 
     res.json({
       message: 'Proposal marked as resolved',
-      proposal: await buildProposalResponse(hydrated, resolver, eligibleVoters)
+      proposal: proposalResponse
     });
   } catch (error) {
-    console.error('[governance:resolve] error', error);
-    res.status(500).json({ error: 'Unable to resolve proposal' });
+    console.error('[governance:resolve/confirm] error', error);
+    res.status(500).json({ error: 'Unable to confirm resolution' });
   }
 });
 
@@ -1876,10 +2882,11 @@ router.post(
         return res.status(404).json({ error: 'User not found' });
       }
       
-      // Allow any DAO member with voting rights (9+ points) to set settlement
+      // Allow any DAO member with voting rights to set settlement
+      const minActivityPoints = await getMinVoteActivityPoints();
       if (!user.canVote()) {
         return res.status(403).json({
-          error: `Minimum ${MIN_VOTE_ACTIVITY_POINTS} activity points required to set settlement amounts`
+          error: `Minimum ${minActivityPoints} activity points required to set settlement amounts`
         });
       }
 
@@ -1923,7 +2930,7 @@ router.post(
 
       const hydrated = await withFinalizedProposal(proposal._id);
       const eligibleVoters = await User.countDocuments({
-        'stats.activityPoints': { $gte: MIN_VOTE_ACTIVITY_POINTS }
+        'stats.activityPoints': { $gte: minActivityPoints }
       });
 
       const proposalResponse = await buildProposalResponse(hydrated, user, eligibleVoters);
@@ -1997,8 +3004,9 @@ router.post(
       await proposal.save();
 
       const hydrated = await withFinalizedProposal(proposal._id);
+      const minActivityPoints = await getMinVoteActivityPoints();
       const eligibleVoters = await User.countDocuments({
-        'stats.activityPoints': { $gte: MIN_VOTE_ACTIVITY_POINTS }
+        'stats.activityPoints': { $gte: minActivityPoints }
       });
 
       const user = await User.findById(req.user.id);
@@ -2052,6 +3060,129 @@ router.post(
         return res.status(400).json({ error: 'Dispute already resolved' });
       }
 
+      // Don't save yet - wait for contract call to succeed
+      // Return data for frontend to call contract first
+
+      // Get chat to extract wallet addresses from escrow transactions
+      let chat = null;
+      let clientWalletAddress = null;
+      let talentWalletAddress = null;
+      
+      if (proposal.disputeContext.jobModel === 'Chat') {
+        chat = await Chat.findById(proposal.disputeContext.job);
+        
+        if (chat?.escrow) {
+          // Get client wallet from deposit transaction (client deposits)
+          if (chat.escrow.deposit?.fromAddress) {
+            clientWalletAddress = chat.escrow.deposit.fromAddress.toLowerCase();
+          }
+          
+          // Get talent wallet from in-progress transaction (talent signs in-progress)
+          // Or from completion transaction, or from deposit toAddress
+          if (chat.escrow.inProgress?.fromAddress) {
+            talentWalletAddress = chat.escrow.inProgress.fromAddress.toLowerCase();
+          } else if (chat.escrow.completion?.fromAddress) {
+            talentWalletAddress = chat.escrow.completion.fromAddress.toLowerCase();
+          } else if (chat.escrow.deposit?.toAddress) {
+            talentWalletAddress = chat.escrow.deposit.toAddress.toLowerCase();
+          }
+        }
+      }
+      
+      // Fallback to user profile wallet addresses if not found in escrow
+      if (!clientWalletAddress) {
+        const clientUser = await User.findById(proposal.disputeContext.client);
+        clientWalletAddress = clientUser?.walletAddress || clientUser?.connectedWalletAddress;
+        if (clientWalletAddress) {
+          clientWalletAddress = clientWalletAddress.toLowerCase();
+        }
+      }
+      
+      if (!talentWalletAddress) {
+        const talentUser = await User.findById(proposal.disputeContext.talent);
+        talentWalletAddress = talentUser?.walletAddress || talentUser?.connectedWalletAddress;
+        if (talentWalletAddress) {
+          talentWalletAddress = talentWalletAddress.toLowerCase();
+        }
+      }
+      
+      if (!clientWalletAddress || !talentWalletAddress) {
+        return res.status(400).json({ 
+          error: 'Client or talent wallet address not found. Please ensure both parties have completed escrow transactions (deposit and in-progress) or have connected wallets in their profile.' 
+        });
+      }
+      
+      // Settlement amounts are in USD, convert to ETH
+      // Use current ETH price or fallback
+      const ethPriceUsd = parseFloat(process.env.ETH_PRICE_USD || 3000);
+      
+      // Calculate ETH amounts from USD settlement amounts
+      // These amounts are already 90% of the job amount (as per requirements)
+      const talentAmountUSD = proposal.disputeContext.settlement.talentAmount || 0;
+      const clientAmountUSD = proposal.disputeContext.settlement.clientAmount || 0;
+      
+      // Convert USD to ETH
+      const talentAmountETH = talentAmountUSD > 0 
+        ? talentAmountUSD / ethPriceUsd 
+        : 0.000005; // Minimum 0.000005 ETH if 0
+      const clientAmountETH = clientAmountUSD > 0
+        ? clientAmountUSD / ethPriceUsd
+        : 0.000005; // Minimum 0.000005 ETH if 0
+
+      res.json({
+        message: 'Ready to resolve dispute by mutual agreement. Please confirm contract transaction.',
+        // Return wallet addresses and amounts for frontend to call DAO contract
+        resolveDisputeData: {
+          clientWalletAddress,
+          talentWalletAddress,
+          clientAmountETH: clientAmountETH || 0.000005, // Minimum 0.000005 ETH if 0
+          talentAmountETH: talentAmountETH || 0.000005, // Minimum 0.000005 ETH if 0
+          shouldCallContract: !!(clientWalletAddress && talentWalletAddress)
+        },
+        proposalId: proposal._id.toString()
+      });
+    } catch (error) {
+      console.error('[governance:settlement/resolve] error', error);
+      res.status(500).json({ error: 'Unable to resolve dispute' });
+    }
+  }
+);
+
+// POST /api/governance/:id/settlement/resolve/confirm
+// Confirm settlement resolution after successful contract call
+router.post(
+  '/:id/settlement/resolve/confirm',
+  auth,
+  ensureDaoProposalEligibility,
+  async (req, res) => {
+    try {
+      const proposal = await Proposal.findById(req.params.id);
+      if (!proposal) {
+        return res.status(404).json({ error: 'Proposal not found' });
+      }
+      if (proposal.proposalType !== 'dispute') {
+        return res.status(400).json({ error: 'Settlement resolution is only available for dispute proposals' });
+      }
+
+      if (!proposal.disputeContext.settlement) {
+        return res.status(400).json({ error: 'Settlement must be configured first' });
+      }
+
+      if (!proposal.disputeContext.settlement.clientApproved || 
+          !proposal.disputeContext.settlement.talentApproved) {
+        return res.status(400).json({ error: 'Both parties must approve before resolving' });
+      }
+
+      if (proposal.disputeContext.settlement.settledByAgreement && proposal.resolution?.resolvedAt) {
+        return res.status(400).json({ error: 'Dispute already resolved' });
+      }
+
+      // Verify contract transaction hash
+      const { txHash } = req.body;
+      if (!txHash) {
+        return res.status(400).json({ error: 'Transaction hash required for settlement resolution' });
+      }
+
       proposal.status = 'resolved';
       proposal.disputeContext.settlement.settledByAgreement = true;
       proposal.disputeContext.settlement.resolvedBy = req.user.id;
@@ -2064,6 +3195,7 @@ router.post(
       proposal.resolution.resolvedBy = req.user.id;
       proposal.resolution.resolvedAt = new Date();
       proposal.resolution.summary = `Dispute resolved by mutual agreement. Talent: ${proposal.disputeContext.settlement.talentAmount}, Client: ${proposal.disputeContext.settlement.clientAmount}`;
+      proposal.resolution.notes = `Resolved via DAO contract. Transaction: ${txHash}`;
 
       await proposal.save();
 
@@ -2073,8 +3205,9 @@ router.post(
       }
 
       const hydrated = await withFinalizedProposal(proposal._id);
+      const minActivityPoints = await getMinVoteActivityPoints();
       const eligibleVoters = await User.countDocuments({
-        'stats.activityPoints': { $gte: MIN_VOTE_ACTIVITY_POINTS }
+        'stats.activityPoints': { $gte: minActivityPoints }
       });
 
       const user = await User.findById(req.user.id);
@@ -2094,8 +3227,8 @@ router.post(
         proposal: proposalResponse
       });
     } catch (error) {
-      console.error('[governance:settlement/resolve] error', error);
-      res.status(500).json({ error: 'Unable to resolve dispute' });
+      console.error('[governance:settlement/resolve/confirm] error', error);
+      res.status(500).json({ error: 'Unable to confirm settlement resolution' });
     }
   }
 );

@@ -16,6 +16,19 @@ PORT=5000
 CLIENT_URL=http://localhost:3000
 MONGODB_URI=mongodb://localhost:27017/workloob
 JWT_SECRET=your-super-secret-jwt-key-change-this-in-production
+
+# Deployer Wallet Address (required for transaction logging)
+# Set this to the wallet address of the deployer/owner
+# This should match the wallet address used to deploy contracts
+DEPLOYER_WALLET_ADDRESS=0x295bd6c0d72336ce54338680696a08102f5ccc7d
+
+# Alternative environment variable names (will be checked in order)
+# PLATFORM_WALLET=0x295bd6c0d72336ce54338680696a08102f5ccc7d
+# OWNER_WALLET_ADDRESS=0x295bd6c0d72336ce54338680696a08102f5ccc7d
+
+# Smart Contract Addresses (optional, defaults to hardcoded values)
+WORKLOB_JOB_CONTRACT_ADDRESS=0xA6788bB9F14dc2663cdB6bE57685cc6eD25B69C7
+WORKLOB_STAKING_CONTRACT_ADDRESS=0xa308a9d9980480e53DfC74B93Ce948f3988B878f
 ```
 
 3. Start MongoDB service

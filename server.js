@@ -22,6 +22,9 @@ const governanceRoutes = require('./routes/governance');
 const referralRoutes = require('./routes/referral');
 const notificationRoutes = require('./routes/notifications');
 const deployerRoutes = require('./routes/deployer');
+const searchRoutes = require('./routes/search');
+const stakingRoutes = require('./routes/staking');
+const blogRoutes = require('./routes/blogs');
 // ethPrice router is imported above as ethPriceRouter
 
 
@@ -41,7 +44,7 @@ const server = createServer(app);
 // CORS configuration - allowed origins (defined before Socket.IO)
 const allowedOrigins = [
   'http://localhost:3000',
-  'http://localhost:3001',
+  'https://blogs.workloob.com',
   process.env.CLIENT_URL
 ].filter(Boolean); // Remove any undefined values
 
@@ -174,6 +177,9 @@ app.use('/api/governance', governanceRoutes);
 app.use('/api/referral', referralRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/deployer', deployerRoutes);
+app.use('/api/staking', stakingRoutes);
+app.use('/api/search', searchRoutes);
+app.use('/api/blogs', blogRoutes);
 app.use('/api/ethprice', ethPriceRouter);
 // Alias route for Escrowintegration.js compatibility
 app.use('/api/v1/price', ethPriceRouter);
@@ -214,36 +220,120 @@ io.on('connection', (socket) => {
       await message.save();
 
       // Update chat's last message and unread counts
-      const chat = await Chat.findById(chatId);
+      const chat = await Chat.findById(chatId)
+        .populate('job', 'title')
+        .populate('gig', 'title');
+        
       if (chat) {
+        // Get sender info for notifications
+        const User = require('./models/User');
+        const sender = await User.findById(senderId).select('username');
+        
         chat.lastMessage = {
           content,
           sender: senderId,
           timestamp: new Date()
         };
 
-        // Increment unread count for all participants except sender
+        // Increment unread count for all participants except sender and create notifications
+        const notificationPromises = [];
+        const emailPromises = [];
+        const { sendNotificationEmail } = require('./utils/emailService');
+        
+        // Fetch all recipients to check their preferences
+        const recipientIds = chat.participants
+          .filter(p => p.user.toString() !== senderId)
+          .map(p => p.user);
+        
+        const recipients = await User.find({ _id: { $in: recipientIds } })
+          .select('notificationEmail preferences.notifications');
+        
+        const recipientMap = new Map();
+        recipients.forEach(r => recipientMap.set(r._id.toString(), r));
+        
         chat.participants.forEach(participant => {
           if (participant.user.toString() !== senderId) {
             const currentCount = chat.unreadCount.get(participant.user.toString()) || 0;
             chat.unreadCount.set(participant.user.toString(), currentCount + 1);
+
+            const recipient = recipientMap.get(participant.user.toString());
+            const shouldSendEmail = recipient?.preferences?.notifications?.email && 
+                                   recipient?.preferences?.notifications?.chat &&
+                                   recipient?.notificationEmail;
 
             // Create notification for the recipient
             const notification = new Notification({
               user: participant.user,
               type: 'message',
               title: 'New Message',
-              message: `You have a new message in your chat`,
+              message: `${sender?.username || 'Someone'} sent you a message${chat.job ? ` about "${chat.job.title}"` : chat.gig ? ` about "${chat.gig.title}"` : ''}`,
               data: {
                 chatId,
-                senderId
+                senderId,
+                senderUsername: sender?.username,
+                messageId: message._id
               }
             });
-            notification.save();
+            notificationPromises.push(notification.save());
+
+            // Send email if chat notifications are enabled and email notifications are enabled
+            if (shouldSendEmail) {
+              const actionUrl = `/chats/${chatId}`;
+              emailPromises.push(
+                sendNotificationEmail({
+                  to: recipient.notificationEmail,
+                  subject: 'New Message on Workloob',
+                  title: 'New Message',
+                  message: `${sender?.username || 'Someone'} sent you a message${chat.job ? ` about "${chat.job.title}"` : chat.gig ? ` about "${chat.gig.title}"` : ''}`,
+                  actionUrl: actionUrl,
+                  actionText: 'View Message'
+                }).then(result => {
+                  if (!result.success) {
+                    console.error('Failed to send email notification:', {
+                      to: recipient.notificationEmail,
+                      error: result.error,
+                      details: result.details
+                    });
+                  }
+                  return result;
+                }).catch(err => {
+                  console.error('Exception sending email notification:', {
+                    to: recipient.notificationEmail,
+                    error: err.message,
+                    code: err.code,
+                    responseCode: err.responseCode
+                  });
+                  // Don't fail the whole operation if email fails
+                  return { success: false, error: err.message };
+                })
+              );
+            } else {
+              console.log('Email not sent for user:', {
+                userId: recipient._id,
+                hasEmail: !!recipient.notificationEmail,
+                emailEnabled: recipient?.preferences?.notifications?.email,
+                chatEnabled: recipient?.preferences?.notifications?.chat
+              });
+            }
           }
         });
 
         await chat.save();
+        
+        // Save all notifications
+        await Promise.all(notificationPromises);
+        
+        // Send emails (don't await to avoid blocking)
+        Promise.all(emailPromises).catch(err => {
+          console.error('Error sending email notifications:', err);
+        });
+        
+        // Emit unread count update for all participants except sender
+        chat.participants.forEach(participant => {
+          if (participant.user.toString() !== senderId) {
+            io.emit('unread-count-updated', { userId: participant.user.toString() });
+          }
+        });
       }
 
       // Broadcast message to all users in the chat room
@@ -301,6 +391,53 @@ app.get('/health', (req, res) => {
 app.use('*', (req, res) => {
   res.status(404).json({ error: 'Route not found' });
 });
+
+// Helper function to clean environment variable values
+const cleanEnvVar = (value, defaultValue = '') => {
+  if (!value) return defaultValue;
+  // Convert to string
+  let cleaned = String(value);
+  // Remove all single and double quotes from anywhere in the string
+  cleaned = cleaned.replace(/['"]/g, '');
+  // Remove trailing commas
+  cleaned = cleaned.replace(/,+$/g, '');
+  // Trim whitespace
+  cleaned = cleaned.trim();
+  return cleaned || defaultValue;
+};
+
+// Check SMTP configuration on startup
+const checkSMTPConfig = () => {
+  const smtpUser = cleanEnvVar(process.env.SMTP_USER);
+  const smtpPass = cleanEnvVar(process.env.SMTP_PASS);
+  const smtpHost = cleanEnvVar(process.env.SMTP_HOST, 'smtp.gmail.com');
+  const smtpPort = cleanEnvVar(process.env.SMTP_PORT, '587');
+  
+  if (!smtpUser || !smtpPass) {
+    console.warn('⚠️  SMTP not configured. Email notifications will not work.');
+    console.warn('   Please set SMTP_USER and SMTP_PASS in your .env file');
+    console.warn('   Raw values:', {
+      SMTP_HOST: process.env.SMTP_HOST || 'undefined',
+      SMTP_PORT: process.env.SMTP_PORT || 'undefined',
+      SMTP_USER: process.env.SMTP_USER ? '***' + process.env.SMTP_USER.slice(-4) : 'NOT SET',
+      SMTP_PASS: process.env.SMTP_PASS ? 'SET' : 'NOT SET'
+    });
+    console.warn('   Cleaned values:', {
+      SMTP_HOST: smtpHost,
+      SMTP_PORT: smtpPort,
+      SMTP_USER: smtpUser ? '***' + smtpUser.slice(-4) : 'NOT SET',
+      SMTP_PASS: smtpPass ? 'SET' : 'NOT SET'
+    });
+  } else {
+    console.log('✅ SMTP configured:', {
+      SMTP_HOST: smtpHost,
+      SMTP_PORT: smtpPort,
+      SMTP_USER: smtpUser.substring(0, 3) + '***' + smtpUser.slice(-4)
+    });
+  }
+};
+
+checkSMTPConfig();
 
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {

@@ -36,7 +36,16 @@ const transactionSchema = new mongoose.Schema({
       'deployer_add_funds',
       'deployer_withdraw',
       'deployer_check_balance',
-      'deployer_verify'
+      'deployer_verify',
+      'staking_pool_fund',
+      'staking_pool_add',
+      'staking_pool_withdraw',
+      'dao_pool_fund_eth',
+      'dao_pool_withdraw_eth',
+      'dao_pool_fund_lob',
+      'dao_pool_withdraw_lob',
+      'dao_set_voter_reward',
+      'blog_withdrawal'
     ],
     required: true
   },
